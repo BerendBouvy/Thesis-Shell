@@ -14,7 +14,7 @@ datums = ['World Geodetic System 84 (4326)',
        'World Geodetic System 84 / UTM zone 32N (32632)']
 
 # metadata = pd.read_csv("metadata copy.csv")
-metadata = pd.read_csv("metadata_with_density_flagged.csv")
+metadata = pd.read_csv("meta/metadata_with_density_flagged.csv")
 
 class dataLoader:
     '''Class to load and process data files based on metadata.'''
@@ -183,10 +183,33 @@ def flag_weird_datasets():
     df["rejected"] = df['CDI-record id'].apply(lambda x: 1 if int(x) in weird_ids else 0)
     df.to_csv("metadata_with_density_flagged.csv", index=False)
     
+def gantt_chart():
+    with open("data_loaders.pkl", "rb") as f:
+        loaders = pickle.load(f)
+        
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    for i, loader in enumerate(loaders):
+        if loader.metadata["point_density(100x100m)"] >20 and loader.metadata["rejected"] == 0:
+            start, end = loader.get_start_end_data()
+            ax.barh(i, (end - start).days, left=start, height=1)
+            
+        
+    ax.set_xlabel('Date')
+    ax.set_ylabel('Datasets')
+    # ax.set_yticks(range(len(loaders)))
+    # ax.set_yticklabels([loader.metadata['LOCAL_CDI_ID'] for loader in loaders])
+    ax.invert_yaxis()
+    plt.title('Gantt Chart of Dataset Collection Periods')
+    plt.tight_layout()
+    plt.savefig("plots/gantt_chart.png")
+    plt.show()
+    
 if __name__ == "__main__":
-    create_data_loaders()
+    # create_data_loaders()
     # create_plots()
     # test1()
     # check_col_names()
     # check_col_names2()
     # flag_weird_datasets()
+    gantt_chart()
