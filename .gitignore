@@ -3,6 +3,7 @@
 data/
 plots/
 *.pkl
+*.zip
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

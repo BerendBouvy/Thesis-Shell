@@ -47,10 +47,6 @@ def get_convex_hull(latitudes, longitudes, zone_number=31, plot=False):
     gdf_utm = gdf.to_crs(utm_crs.to_string())
     
     convex_hull_utm = gdf_utm.union_all().convex_hull
-
-    area_sq_m = convex_hull_utm.area #m2
-    
-    resolution = len(gdf_utm) / area_sq_m # points per m2
     
     if plot:
         fig, ax = plt.subplots()
@@ -63,7 +59,15 @@ def get_convex_hull(latitudes, longitudes, zone_number=31, plot=False):
         plt.legend()
         plt.show()
         
+    return convex_hull_utm, gdf_utm
+
+def get_resolution_convex_hull(latitudes, longitudes, zone_number=31, plot=False):
+    convex_hull_utm, gdf_utm = get_convex_hull(latitudes, longitudes, zone_number=zone_number, plot=plot)
+    area_sq_m = convex_hull_utm.area #m2
+    resolution = len(gdf_utm) / area_sq_m # points per m2
     return  area_sq_m*1e-6, resolution
+
+
 
 def analyze_data_density(latitudes, longitudes, zone_number=31, plot=False):
     gdf = gpd.GeoDataFrame(geometry=gpd.points_from_xy(longitudes, latitudes), crs="EPSG:4326")

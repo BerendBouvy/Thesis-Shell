@@ -6,7 +6,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 from datetime import datetime
-
+from points import grid_heatmap
 
 data_folder = "data"
 datums = ['World Geodetic System 84 (4326)',
@@ -14,7 +14,7 @@ datums = ['World Geodetic System 84 (4326)',
        'World Geodetic System 84 / UTM zone 32N (32632)']
 
 # metadata = pd.read_csv("metadata copy.csv")
-metadata = pd.read_csv("meta/metadata_with_density_flagged.csv")
+metadata = pd.read_csv("meta/metadata_with_density_flagged2.csv")
 
 class dataLoader:
     '''Class to load and process data files based on metadata.'''
@@ -91,6 +91,12 @@ class dataLoader:
             print("No data available.")
             return None
         
+    def get_convex_hull(self, zone_number=31, plot=False):
+        latitudes = self.data['Lat'].to_list()
+        longitudes = self.data['Lon'].to_list()
+        convex_hull_utm, gdf_utm = get_convex_hull(latitudes, longitudes, zone_number=zone_number, plot=plot)
+        return convex_hull_utm, gdf_utm
+        
     def __repr__(self):
         return f"dataLoader for CDI ID: {self.metadata['LOCAL_CDI_ID']} with {self.data.shape[0]} points."
     
@@ -112,12 +118,12 @@ class dataLoader:
 def create_data_loaders():
     loaders = []
     for idx in tqdm(range(len(metadata))):
-        if metadata.iloc[idx]['rejected'] == 0:
+        if metadata.iloc[idx]['rejected'] == 0 and metadata.iloc[idx]['point_density(100x100m)'] > 20:
             sample_metadata = metadata.iloc[idx]
             loader = dataLoader(sample_metadata)
             loaders.append(loader)
         else:
-            print(f"Skipping rejected dataset with CDI ID: {metadata.iloc[idx]['LOCAL_CDI_ID']}")
+            print(f"Skipping rejected ({metadata.iloc[idx]['rejected']}) or low-density ({metadata.iloc[idx]['point_density(100x100m)']}) dataset with CDI ID: {metadata.iloc[idx]['LOCAL_CDI_ID']}")
     print(f"Created {len(loaders)} data loaders.")
 
     with open("data_loaders.pkl", "wb") as f:
@@ -205,11 +211,70 @@ def gantt_chart():
     plt.savefig("plots/gantt_chart.png")
     plt.show()
     
+def plot_number_of_points():
+    # Open data loaders
+    with open("data_loaders.pkl", "rb") as f:
+        loaders = pickle.load(f)
+        
+    # Loop only through non-rejected datasets
+    all_lats = []
+    all_lons = []
+    for loader in loaders:
+        if loader.metadata["rejected"] == 0:
+            all_lats.extend(loader.data['Lat'].to_list())
+            all_lons.extend(loader.data['Lon'].to_list())
+        
+    #create a raster grid of 10000x10000m and count number of points in each cell
+    grid_size = 10000  # meters
+    utm_crs = pp.CRS(f"+proj=utm +zone=31 +datum=WGS84 +units=m +no_defs")
+    gdf = gpd.GeoDataFrame(geometry=gpd.points_from_xy(all_lons, all_lats), crs="EPSG:4326")
+    gdf_utm = gdf.to_crs(utm_crs.to_string())
+    bounds = gdf_utm.total_bounds  # minx, miny, maxx, maxy
+    # create a plot with the grid and colors based on number of points in each cell
+    # use a method that can handle large number of points efficiently
+    x_bins = np.arange(bounds[0], bounds[2] + grid_size, grid_size)
+    y_bins = np.arange(bounds[1], bounds[3] + grid_size, grid_size)
+    density, xedges, yedges = np.histogram2d(gdf_utm.geometry.x, gdf_utm.geometry.y, bins=[x_bins, y_bins])
+    plt.figure(figsize=(10, 8))
+    plt.imshow(density.T, origin='lower', cmap='hot', 
+               extent=[bounds[0], bounds[2], bounds[1], bounds[3]])
+    plt.colorbar(label='Number of Points per 1000x1000m cell')
+    plt.title('Point Density Map (1000x1000m cells)')
+    plt.xlabel('Easting (m)')
+    plt.ylabel('Northing (m)')
+    plt.savefig("plots/point_density_1000m.png")
+    plt.show()
+    
+        
+def hm():
+    with open("data_loaders.pkl", "rb") as f:
+        loaders = pickle.load(f)
+        
+    all_lats = []
+    all_lons = []
+    for loader in loaders:
+        if loader.metadata["rejected"] == 0:
+            all_lats.extend(loader.data['Lat'].to_list())
+            all_lons.extend(loader.data['Lon'].to_list())
+            
+    counts, (lat_edges, lon_edges) = grid_heatmap(
+        latitudes=all_lats,
+        longitudes=all_lons,
+        cell_size=100,
+        cmap='hot',
+        show=True,
+        save_path="plots/heatmap_all_data.png"
+    )         
+    
+        
+    
 if __name__ == "__main__":
-    # create_data_loaders()
+    create_data_loaders()
     # create_plots()
     # test1()
     # check_col_names()
     # check_col_names2()
     # flag_weird_datasets()
-    gantt_chart()
+    # gantt_chart()
+    # plot_number_of_points()
+    # hm()
