@@ -21,8 +21,14 @@ class dataLoader:
     def __init__(self, metadata):        
         self.metadata = metadata
         self.id = metadata["CDI-record id"]
+        print(f"Loading data for CDI ID: {self.metadata['LOCAL_CDI_ID']}")
         self.data = self.load_data()
+        print(f"Loaded {self.data.shape[0]} data points.")
+        print("Processing coordinates...")
         self.get_coordinates()
+        print("Converting to UTM Zone 31N...")
+        self.get_N31_coordinates()
+        print("Done.")
         
         
     def file_path(self):
@@ -55,7 +61,14 @@ class dataLoader:
             
         else:
             print("No recognizable coordinate columns found.", self.data.columns.to_list())
-
+    
+    def get_N31_coordinates(self):
+        if not 'Lat' in self.data.columns or not 'Lon' in self.data.columns:
+            self.get_coordinates()
+        transformer = pp.Transformer.from_crs("EPSG:4326", "EPSG:32631", always_xy=True)
+        self.data['Easting_N31'], self.data['Northing_N31'] = transformer.transform(self.data['Lon'].to_list(), self.data['Lat'].to_list()) 
+        
+        
     def plot_data(self, save_path=None, show=True, bbox=False):
         '''Plot the data points on a map with optional bounding box.'''
         if self.data is not None:
@@ -126,7 +139,7 @@ def create_data_loaders():
             print(f"Skipping rejected ({metadata.iloc[idx]['rejected']}) or low-density ({metadata.iloc[idx]['point_density(100x100m)']}) dataset with CDI ID: {metadata.iloc[idx]['LOCAL_CDI_ID']}")
     print(f"Created {len(loaders)} data loaders.")
 
-    with open("data_loaders.pkl", "wb") as f:
+    with open("data_loaders_v2.pkl", "wb") as f:
         pickle.dump(loaders, f)
         
 def create_plots():
