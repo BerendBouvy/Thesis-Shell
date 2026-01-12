@@ -1,5 +1,6 @@
 import pandas as pd
 import os
+from shapely import Polygon
 from coordFunc import *
 import pickle
 from tqdm import tqdm
@@ -7,6 +8,12 @@ import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
 from datetime import datetime
 from points import grid_heatmap
+import rasterio.features as rfeatures
+import rasterio.transform as rtransform
+import pyproj as pp
+import numpy as np
+
+
 
 data_folder = "data"
 datums = ['World Geodetic System 84 (4326)',
@@ -74,7 +81,7 @@ class dataLoader:
         if self.data is not None:
             plt.figure(figsize=(10, 8))
             ax = plt.axes(projection=ccrs.PlateCarree())
-            sc = ax.scatter(self.data['Lon'], self.data['Lat'], c=self.data['Mean (m)'], cmap='viridis', s=10)
+            sc = ax.scatter(self.data['Lon'], self.data['Lat'], c=self.data['Mean (m)'], cmap='viridis', s=1)
             plt.colorbar(sc, label='Mean (m)')
             ax.coastlines()
             ax.set_title(f"Data Plot for {self.metadata['LOCAL_CDI_ID']}")
@@ -126,8 +133,52 @@ class dataLoader:
         start = datetime.strptime(str(start), "%Y%m%d")
         end = datetime.strptime(str(end), "%Y%m%d")
         return start, end
-        
-        
+    
+    def get_raster(self, location, width, height, cell_size=20):
+        if not 'Easting_N31' in self.data.columns or not 'Northing_N31' in self.data.columns:
+            self.get_N31_coordinates()
+            
+        width = int(width/cell_size) * cell_size
+        height = int(height/cell_size) * cell_size
+        easting = self.data['Easting_N31'].to_numpy()
+        northing = self.data['Northing_N31'].to_numpy()
+        values = self.data['Mean (m)'].to_numpy()
+        points = gpd.GeoDataFrame(geometry=gpd.points_from_xy(easting, northing), crs="EPSG:32631")
+        bbox = (location[0] - width/2, 
+                location[1] - height/2,
+                location[0] + width/2,
+                location[1] + height/2)
+        bbox_polygon = Polygon([(bbox[0], bbox[1]),
+                                (bbox[2], bbox[1]),
+                                (bbox[2], bbox[3]),
+                                (bbox[0], bbox[3])])
+        points_in_bbox = points[points.within(bbox_polygon)]
+        if points_in_bbox.empty:
+            print("No points found in the specified bounding box.")
+            return None, bbox
+        values_in_bbox = values[points_in_bbox.index]
+        raster = rfeatures.rasterize(
+            ((geom, value) for geom, value in zip(points_in_bbox.geometry, values_in_bbox)),
+            out_shape=(int(height/cell_size), int(width/cell_size)),
+            transform=rtransform.from_bounds(bbox[0], bbox[1], bbox[2], bbox[3], int(width/cell_size), int(height/cell_size)),
+            fill=np.nan,
+            all_touched=True,
+            dtype='float32'
+        )
+        return raster, bbox
+    
+    def get_raster2(self, easting, northing, points_in_bbox, bbox, cell_size=20):
+        values_in_bbox = self.data.loc[points_in_bbox.index, 'Mean (m)'].to_numpy()
+        raster = rfeatures.rasterize(
+            ((geom, value) for geom, value in zip(points_in_bbox.geometry, values_in_bbox)),
+            out_shape=(int((bbox[3]-bbox[1])/cell_size), int((bbox[2]-bbox[0])/cell_size)),
+            transform=rtransform.from_bounds(bbox[0], bbox[1], bbox[2], bbox[3], int((bbox[2]-bbox[0])/cell_size), int((bbox[3]-bbox[1])/cell_size)),
+            fill=np.nan,
+            all_touched=True,
+            dtype='float32'
+        )
+        return raster, bbox
+    
 def create_data_loaders():
     loaders = []
     for idx in tqdm(range(len(metadata))):
@@ -282,6 +333,7 @@ def hm():
         
     
 if __name__ == "__main__":
+    # pass
     create_data_loaders()
     # create_plots()
     # test1()

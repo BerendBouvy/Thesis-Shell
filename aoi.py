@@ -111,7 +111,72 @@ class AreaOfInterest:
             transform=rasterio.transform.from_bounds(x_min, y_min, x_max, y_max, raster_flipped.shape[1], raster_flipped.shape[0]),
         ) as dst:
             dst.write(raster_flipped, 1)    
+            
+    def plot_dls(self, dataloaders, location, width=1000, height=1000):
+        bbox = (location[0] - width/2, 
+                location[1] - height/2,
+                location[0] + width/2,
+                location[1] + height/2)
         
+        bbox_polygon = Polygon([(bbox[0], bbox[1]),
+                                (bbox[2], bbox[1]),
+                                (bbox[2], bbox[3]),
+                                (bbox[0], bbox[3])])
+        # plot bbox in AOI
+        fig, ax = plt.subplots()
+        self.aoi_gdf.to_crs(epsg=32631).plot(ax=ax, facecolor='none', edgecolor='red', linewidth=2)
+        ax.plot([bbox[0], bbox[2], bbox[2], bbox[0], bbox[0]],
+                [bbox[1], bbox[1], bbox[3], bbox[3], bbox[1]],
+                color='green', linewidth=2)
+    
+                
+        dls_to_plot = {}
+        
+        for dl in dataloaders:
+            print(f"Processing CDI ID: {dl.metadata['LOCAL_CDI_ID']}")
+            easting = dl.data['Easting_N31'].to_numpy()
+            northing = dl.data['Northing_N31'].to_numpy()
+            
+            points = gpd.GeoDataFrame(geometry=gpd.points_from_xy(easting, northing), crs=self.crs)
+            points_in_bbox = points[points.within(bbox_polygon)]
+            if not points_in_bbox.empty:
+                dls_to_plot[dl.metadata['LOCAL_CDI_ID']] = [dl, easting, northing, points, points_in_bbox]
+        n = len(dls_to_plot)
+        if n == 0:
+            print("No dataloaders have points in the bounding box.")
+            return
+
+        rows = int(np.ceil(n ** 0.5))
+        fig, axes = plt.subplots(rows, rows, figsize=(4.5*rows, 4.5*rows))
+        if isinstance(axes, np.ndarray):
+            axes = axes.ravel()
+        else:
+            axes = np.array([axes])
+
+        print(f"Plotting {n} data loaders within the bounding box.")
+        for ax, (cdi_id, (dl, easting, northing, points, points_in_bbox)) in zip(axes, dls_to_plot.items()):
+            raster, _ = dl.get_raster2(easting, northing, points_in_bbox, bbox=bbox, cell_size=20)
+            ax.set_title(f"year: {str(dl.metadata.get('Start Date'))[:4]}", fontsize=9)
+            if not points_in_bbox.empty:
+                ax.imshow(raster, extent=bbox, origin='lower', cmap='viridis')
+            ax.set_xlim(bbox[0], bbox[2])
+            ax.set_ylim(bbox[1], bbox[3])
+            ax.set_xticks([])
+            ax.set_yticks([])
+            
+            
+            
+            
+        # hide unused axes
+        for ax in axes[n:]:
+            ax.axis('off')
+        fig.tight_layout()
+        fig.savefig("dataloaders_in_bbox.png", dpi=300)
+        plt.show()
+        
+                
+        
+         
 def hist():
     # open the tif and plot histogram
     with rasterio.open("data_count_raster.tif") as src:
@@ -132,18 +197,20 @@ def hist():
 if __name__ == "__main__":
     # Example usage
     aoi = AreaOfInterest("AOI.txt")
-    # with open("data_loaders_v2.pkl", "rb") as f:
-    #     dataloaders = pickle.load(f)
-    #     print(f"Loaded {len(dataloaders)} data loaders from pickle.")
+    with open("data_loaders_v2.pkl", "rb") as f:
+        dataloaders = pickle.load(f)
+        print(f"Loaded {len(dataloaders)} data loaders from pickle.")
+    aoi.plot_dls(dataloaders, location=(604483, 5919580), width=2000, height=2000)
+    
     
     # aoi.get_raster(dataloaders, delta_x=100, delta_y=100, plot=True, normalize=False)   
     
     # hist()
     
     #print lon lat of aoi transformed to epsg:4326
-    aoi_wgs84 = aoi.aoi_gdf.to_crs(epsg=4326)
-    for idx, row in aoi_wgs84.iterrows():
-        print(f"AOI Polygon in WGS84 (EPSG:4326) - {idx}:")
-        for coord in row['geometry'].exterior.coords:
-            print(f"Lon: {coord[0]:.6f}, Lat: {coord[1]:.6f}")
+    # aoi_wgs84 = aoi.aoi_gdf.to_crs(epsg=4326)
+    # for idx, row in aoi_wgs84.iterrows():
+    #     print(f"AOI Polygon in WGS84 (EPSG:4326) - {idx}:")
+    #     for coord in row['geometry'].exterior.coords:
+    #         print(f"Lon: {coord[0]:.6f}, Lat: {coord[1]:.6f}")
     
