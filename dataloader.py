@@ -35,6 +35,8 @@ class dataLoader:
         self.get_coordinates()
         print("Converting to UTM Zone 31N...")
         self.get_N31_coordinates()
+        print("Saving Convex Hull...")
+        self.convex_hull_utm, self.gdf_utm = self.get_convex_hull(zone_number=31, plot=False)
         print("Done.")
         
         
@@ -134,7 +136,7 @@ class dataLoader:
         end = datetime.strptime(str(end), "%Y%m%d")
         return start, end
     
-    def get_raster(self, location, width, height, cell_size=20):
+    def get_raster(self, location, width, height, cell_size=20, point_location='middle'):
         if not 'Easting_N31' in self.data.columns or not 'Northing_N31' in self.data.columns:
             self.get_N31_coordinates()
             
@@ -144,10 +146,16 @@ class dataLoader:
         northing = self.data['Northing_N31'].to_numpy()
         values = self.data['Mean (m)'].to_numpy()
         points = gpd.GeoDataFrame(geometry=gpd.points_from_xy(easting, northing), crs="EPSG:32631")
-        bbox = (location[0] - width/2, 
-                location[1] - height/2,
-                location[0] + width/2,
-                location[1] + height/2)
+        if point_location == 'middle':
+            bbox = (location[0] - width/2, 
+                    location[1] - height/2,
+                    location[0] + width/2,
+                    location[1] + height/2)
+        elif point_location == 'lower_left':
+            bbox = (location[0], 
+                    location[1],
+                    location[0] + width,
+                    location[1] + height)
         bbox_polygon = Polygon([(bbox[0], bbox[1]),
                                 (bbox[2], bbox[1]),
                                 (bbox[2], bbox[3]),

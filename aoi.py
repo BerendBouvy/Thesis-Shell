@@ -33,11 +33,8 @@ class AreaOfInterest:
         ax = plt.axes(projection=ccrs.PlateCarree())
         self.aoi_gdf.to_crs(epsg=4326).plot(ax=ax, facecolor='none', edgecolor='red', linewidth=2)
         ax.coastlines(resolution='10m')
-
-        ax.set_title("Area of Interest")
-        
-        
-        plt.show()
+        ax.set_title("Area of Interest")       
+        return fig, ax
         
         
     def get_raster(self, dataloaders, delta_x=1000, delta_y=1000, plot=False, normalize=True):
@@ -175,7 +172,11 @@ class AreaOfInterest:
         plt.show()
         
                 
-        
+    def get_dimensions(self):
+        bounds = self.aoi_gdf.total_bounds  # minx, miny, maxx, maxy
+        width = bounds[2] - bounds[0]
+        height = bounds[3] - bounds[1]
+        return width, height
          
 def hist():
     # open the tif and plot histogram
