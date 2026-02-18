@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import cartopy.crs as ccrs
-from dataloader import dataLoader
+from dataloader import DataLoader
 
 
 def test_conv_hull():

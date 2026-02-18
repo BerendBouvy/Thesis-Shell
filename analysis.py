@@ -6,7 +6,9 @@ import aoi
 import os
 import tqdm
 from shapely.geometry import Polygon
-import time     
+import time 
+from destriping import destripe_raster    
+import cmocean
 
 
 def analyse(cell_corners):
@@ -24,27 +26,42 @@ def analyse(cell_corners):
         poly = Polygon([(x, y), (x + 5000, y), (x + 5000, y + 5000), (x, y + 5000)])
         cell_gdf = gpd.GeoDataFrame(geometry=[poly], crs=crs)
         raster_list = []
+        raster_destriped_list = []
         dl_list = []
         for dl in tqdm.tqdm(dls):
             convex_hull_utm = dl.convex_hull_utm
             if convex_hull_utm.intersects(poly):
                 print(f"  Cell {cid} intersects with CDI ID: {dl.metadata['CDI-record id']}")
-                raster, _ = dl.get_raster(location=(x, y), width=5000, height=5000, cell_size=30, point_location='lower_left')
+                raster, _ = dl.get_raster(location=(x, y), width=5000, height=5000, cell_size=20, point_location='lower_left')
                 if raster is None:
                     print(f"    No data points in cell {cid} for CDI ID: {dl.metadata['CDI-record id']}")
                     continue
+                elif np.sum(~np.isnan(raster)) < 0.2 * raster.size:
+                    print(f"    Warning: Only {np.sum(~np.isnan(raster))}/{raster.size} pixels have data in cell {cid} for CDI ID: {dl.metadata['CDI-record id']}. Skipping destriping.")
+                    continue
                 else:
                     raster_list.append(raster)
+                    destriped = destripe_raster(
+                        raster, 
+                        trend_param=3, 
+                        plot=True, 
+                        style='line', 
+                        width=5, 
+                        pad_style='wrap', 
+                        detrend='gaussian', 
+                        save_plot=f"destriping_results/cell_{cid}/CDI_{dl.metadata['CDI-record id']}")
+                    raster_destriped_list.append(destriped)
                     dl_list.append(dl)
                     fig, ax = plt.subplots(figsize=(6, 6))
                     ax.set_title(f"CDI ID: {dl.metadata['CDI-record id']}\nYear: {str(dl.metadata.get('Start Date'))[:4]}")
                     
                     # Set extent to map raster pixels to UTM coordinates
                     raster_extent = [x, x + 5000, y, y + 5000]
-                    im = ax.imshow(raster, cmap='viridis', extent=raster_extent, origin='upper', aspect='auto')
-                    
+                    # im = ax.imshow(raster, cmap='viridis', extent=raster_extent, origin='upper', aspect='auto')
+                    im = ax.imshow(destriped, cmap=cmocean.cm.deep, extent=raster_extent, origin='upper', aspect='auto')
+
                     # Plot cell boundary in UTM coordinates
-                    cell_gdf.plot(ax=ax, facecolor='none', edgecolor='red', linewidth=2)
+                    # cell_gdf.plot(ax=ax, facecolor='none', edgecolor='red', linewidth=2)
                     
                     ax.set_xlabel('Easting (m)')
                     ax.set_ylabel('Northing (m)')
@@ -54,9 +71,10 @@ def analyse(cell_corners):
         for i in range(len(raster_list)):
             for j in range(len(raster_list)):
                 if str(dl_list[i].metadata['Start Date']) > str(dl_list[j].metadata['Start Date']):
-                    compare_rasters(raster_list[i], raster_list[j], dl_list[i], dl_list[j], cid)
-        # break  # remove this break to process all cells
-    
+                    # compare_rasters(raster_list[i], raster_list[j], dl_list[i], dl_list[j], cid)
+                    compare_rasters(raster_destriped_list[i], raster_destriped_list[j], dl_list[i], dl_list[j], cid)
+        # break
+    return    
 
 def plot_cells(aoi_obj, cell_corners, cell_size=5000, save_path=None):
     fig, ax = aoi_obj.plot_aoi()

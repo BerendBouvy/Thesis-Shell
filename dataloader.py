@@ -23,7 +23,7 @@ datums = ['World Geodetic System 84 (4326)',
 # metadata = pd.read_csv("metadata copy.csv")
 metadata = pd.read_csv("meta/metadata_with_density_flagged2.csv")
 
-class dataLoader:
+class DataLoader:
     '''Class to load and process data files based on metadata.'''
     def __init__(self, metadata):        
         self.metadata = metadata
@@ -96,6 +96,7 @@ class dataLoader:
                 ax.plot(scatter_points['lat1'], scatter_points['lon1'], color='red')
             if save_path:
                 plt.savefig(save_path)
+            plt.show()
             if not show:
                 plt.close()
             
@@ -136,7 +137,7 @@ class dataLoader:
         end = datetime.strptime(str(end), "%Y%m%d")
         return start, end
     
-    def get_raster(self, location, width, height, cell_size=20, point_location='middle'):
+    def get_raster(self, location, width, height, cell_size=20, point_location='middle', interpolate=False):
         if not 'Easting_N31' in self.data.columns or not 'Northing_N31' in self.data.columns:
             self.get_N31_coordinates()
             
@@ -161,18 +162,46 @@ class dataLoader:
                                 (bbox[2], bbox[3]),
                                 (bbox[0], bbox[3])])
         points_in_bbox = points[points.within(bbox_polygon)]
+    
         if points_in_bbox.empty:
             print("No points found in the specified bounding box.")
             return None, bbox
         values_in_bbox = values[points_in_bbox.index]
-        raster = rfeatures.rasterize(
-            ((geom, value) for geom, value in zip(points_in_bbox.geometry, values_in_bbox)),
-            out_shape=(int(height/cell_size), int(width/cell_size)),
-            transform=rtransform.from_bounds(bbox[0], bbox[1], bbox[2], bbox[3], int(width/cell_size), int(height/cell_size)),
-            fill=np.nan,
-            all_touched=True,
-            dtype='float32'
-        )
+        done = False
+        correction = 0
+        while done == False:
+            raster = rfeatures.rasterize(
+                ((geom, value) for geom, value in zip(points_in_bbox.geometry, values_in_bbox)),
+                out_shape=(int(height/cell_size), int(width/cell_size)),
+                transform=rtransform.from_bounds(bbox[0]+correction, bbox[1]+correction, bbox[2]+correction, bbox[3], int(width/cell_size), int(height/cell_size)),
+                fill=np.nan,
+                all_touched=True,
+                dtype='float32'
+            )
+            # count non-nans
+            non_nan_count = np.count_nonzero(~np.isnan(raster))
+            if non_nan_count/len(points_in_bbox) < 0.8:
+                correction += 1
+                if correction > cell_size//2:
+                    print(f"Warning: Only {non_nan_count}/{len(points_in_bbox)} points rasterized after {correction} attempts. Consider increasing cell size or checking point distribution.")
+                    done = True
+            else:
+                done = True
+                print(f"Rasterization successful with {non_nan_count}/{len(points_in_bbox)} points rasterized.")
+        if interpolate:
+            # Only fill NaNs that are surrounded by finite values on all four sides
+            center = raster[1:-1, 1:-1]
+            nan_mask = np.isnan(center)
+
+            left = raster[1:-1, 0:-2]
+            right = raster[1:-1, 2:]
+            up = raster[0:-2, 1:-1]
+            down = raster[2:, 1:-1]
+
+            fill_mask = nan_mask & np.isfinite(left) & np.isfinite(right) & np.isfinite(up) & np.isfinite(down)
+            if np.any(fill_mask):
+                center[fill_mask] = (left[fill_mask] + right[fill_mask] + up[fill_mask] + down[fill_mask]) / 4.0
+            
         return raster, bbox
     
     def get_raster2(self, easting, northing, points_in_bbox, bbox, cell_size=20):
@@ -192,7 +221,7 @@ def create_data_loaders():
     for idx in tqdm(range(len(metadata))):
         if metadata.iloc[idx]['rejected'] == 0 and metadata.iloc[idx]['point_density(100x100m)'] > 20:
             sample_metadata = metadata.iloc[idx]
-            loader = dataLoader(sample_metadata)
+            loader = DataLoader(sample_metadata)
             loaders.append(loader)
         else:
             print(f"Skipping rejected ({metadata.iloc[idx]['rejected']}) or low-density ({metadata.iloc[idx]['point_density(100x100m)']}) dataset with CDI ID: {metadata.iloc[idx]['LOCAL_CDI_ID']}")

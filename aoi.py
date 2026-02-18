@@ -7,7 +7,7 @@ import cartopy.crs as ccrs
 import numpy as np
 import rasterio
 import pickle
-from dataloader import dataLoader
+from dataloader import DataLoader
 class AreaOfInterest:
     def __init__(self, file_path, crs="EPSG:32631"):
         # Use UTM Zone 31N as default CRS
