@@ -79,7 +79,10 @@ class DataLoader:
         
         
     def plot_data(self, save_path=None, show=True, bbox=False):
-        '''Plot the data points on a map with optional bounding box.'''
+        '''Plot data points on a map with optional bounding box.
+
+        If `save_path` is provided, the figure is saved and not shown.
+        '''
         if self.data is not None:
             plt.figure(figsize=(10, 8))
             ax = plt.axes(projection=ccrs.PlateCarree())
@@ -96,8 +99,10 @@ class DataLoader:
                 ax.plot(scatter_points['lat1'], scatter_points['lon1'], color='red')
             if save_path:
                 plt.savefig(save_path)
-            plt.show()
-            if not show:
+                plt.close()
+            elif show:
+                plt.show()
+            else:
                 plt.close()
             
         else:
@@ -114,10 +119,20 @@ class DataLoader:
             print("No data available.")
             return None
         
-    def get_convex_hull(self, zone_number=31, plot=False):
+    def get_convex_hull(self, zone_number=31, plot=False, save_path=None):
+        '''Compute convex hull in UTM space.
+
+        If `plot` is True and `save_path` is provided, the plot is saved and not shown.
+        '''
         latitudes = self.data['Lat'].to_list()
         longitudes = self.data['Lon'].to_list()
-        convex_hull_utm, gdf_utm = get_convex_hull(latitudes, longitudes, zone_number=zone_number, plot=plot)
+        convex_hull_utm, gdf_utm = get_convex_hull(
+            latitudes,
+            longitudes,
+            zone_number=zone_number,
+            plot=plot,
+            save_path=save_path,
+        )
         return convex_hull_utm, gdf_utm
         
     def __repr__(self):
@@ -290,7 +305,11 @@ def flag_weird_datasets():
     df["rejected"] = df['CDI-record id'].apply(lambda x: 1 if int(x) in weird_ids else 0)
     df.to_csv("metadata_with_density_flagged.csv", index=False)
     
-def gantt_chart():
+def gantt_chart(save_path=None):
+    """Plot a Gantt chart of dataset collection periods.
+
+    If `save_path` is provided, the figure is saved and not shown.
+    """
     with open("data_loaders.pkl", "rb") as f:
         loaders = pickle.load(f)
         
@@ -309,10 +328,18 @@ def gantt_chart():
     ax.invert_yaxis()
     plt.title('Gantt Chart of Dataset Collection Periods')
     plt.tight_layout()
-    plt.savefig("plots/gantt_chart.png")
-    plt.show()
+    target = save_path or "plots/gantt_chart.png"
+    plt.savefig(target)
+    if save_path:
+        plt.close(fig)
+    else:
+        plt.show()
     
-def plot_number_of_points():
+def plot_number_of_points(save_path=None):
+    """Plot a coarse point-density raster for non-rejected datasets.
+
+    If `save_path` is provided, the figure is saved and not shown.
+    """
     # Open data loaders
     with open("data_loaders.pkl", "rb") as f:
         loaders = pickle.load(f)
@@ -343,11 +370,19 @@ def plot_number_of_points():
     plt.title('Point Density Map (1000x1000m cells)')
     plt.xlabel('Easting (m)')
     plt.ylabel('Northing (m)')
-    plt.savefig("plots/point_density_1000m.png")
-    plt.show()
+    target = save_path or "plots/point_density_1000m.png"
+    plt.savefig(target)
+    if save_path:
+        plt.close()
+    else:
+        plt.show()
     
         
-def hm():
+def hm(save_path=None):
+    """Plot a lat/lon heatmap for non-rejected datasets.
+
+    If `save_path` is provided, the figure is saved and not shown.
+    """
     with open("data_loaders.pkl", "rb") as f:
         loaders = pickle.load(f)
         
@@ -363,15 +398,25 @@ def hm():
         longitudes=all_lons,
         cell_size=100,
         cmap='hot',
-        show=True,
-        save_path="plots/heatmap_all_data.png"
+        show=save_path is None,
+        save_path=save_path or "plots/heatmap_all_data.png"
     )         
     
         
+        
+def create_small_loader():
+    # Create a small dataloader for testing
+    dls = pickle.load(open("data_loaders_v2.pkl", "rb"))
+    print(f"Loaded {len(dls)} data loaders from pickle.")
     
+    dls_small = dls[:5]  # Take the first 5 loaders for testing
+    print(f"Created small list of {len(dls_small)} data loaders for testing.")
+    with open("data_loaders_small.pkl", "wb") as f:
+        pickle.dump(dls_small, f)
+            
 if __name__ == "__main__":
     # pass
-    create_data_loaders()
+    # create_data_loaders()
     # create_plots()
     # test1()
     # check_col_names()
@@ -380,3 +425,4 @@ if __name__ == "__main__":
     # gantt_chart()
     # plot_number_of_points()
     # hm()
+    create_small_loader()

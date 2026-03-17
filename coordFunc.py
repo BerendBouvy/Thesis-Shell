@@ -40,7 +40,11 @@ def convert_northing_easting(northing, easting, datum):
     lon, lat = transformer.transform(easting, northing)
     return lat, lon
 
-def get_convex_hull(latitudes, longitudes, zone_number=31, plot=False):
+def get_convex_hull(latitudes, longitudes, zone_number=31, plot=False, save_path=None):
+    """Compute the convex hull of input points in UTM coordinates.
+
+    If `plot` is True and `save_path` is provided, the plot is saved and not shown.
+    """
     gdf = gpd.GeoDataFrame(geometry=gpd.points_from_xy(longitudes, latitudes), crs="EPSG:4326")
     
     utm_crs = pp.CRS(f"+proj=utm +zone={zone_number} +datum=WGS84 +units=m +no_defs")
@@ -57,19 +61,37 @@ def get_convex_hull(latitudes, longitudes, zone_number=31, plot=False):
         hull_gdf = hull_gdf.to_crs("EPSG:4326")
         hull_gdf.boundary.plot(ax=ax, color='red', linewidth=2, label='Convex Hull')
         plt.legend()
-        plt.show()
+        if save_path:
+            fig.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.close(fig)
+        else:
+            plt.show()
         
     return convex_hull_utm, gdf_utm
 
-def get_resolution_convex_hull(latitudes, longitudes, zone_number=31, plot=False):
-    convex_hull_utm, gdf_utm = get_convex_hull(latitudes, longitudes, zone_number=zone_number, plot=plot)
+def get_resolution_convex_hull(latitudes, longitudes, zone_number=31, plot=False, save_path=None):
+    """Return convex-hull area (km^2) and point density (points/m^2).
+
+    Plot behavior is delegated to `get_convex_hull`; `save_path` saves without showing.
+    """
+    convex_hull_utm, gdf_utm = get_convex_hull(
+        latitudes,
+        longitudes,
+        zone_number=zone_number,
+        plot=plot,
+        save_path=save_path,
+    )
     area_sq_m = convex_hull_utm.area #m2
     resolution = len(gdf_utm) / area_sq_m # points per m2
     return  area_sq_m*1e-6, resolution
 
 
 
-def analyze_data_density(latitudes, longitudes, zone_number=31, plot=False):
+def analyze_data_density(latitudes, longitudes, zone_number=31, plot=False, save_path=None):
+    """Estimate average local point density on a 100x100 m grid.
+
+    If `plot` is True and `save_path` is provided, the histogram is saved and not shown.
+    """
     gdf = gpd.GeoDataFrame(geometry=gpd.points_from_xy(longitudes, latitudes), crs="EPSG:4326")
     
     utm_crs = pp.CRS(f"+proj=utm +zone={zone_number} +datum=WGS84 +units=m +no_defs")
@@ -86,12 +108,16 @@ def analyze_data_density(latitudes, longitudes, zone_number=31, plot=False):
     # print("Density calculated over grid cells of size 100x100 meters.")
     print("Ave range density (points per grid cell):\t",  ave_density.round(3))
     if plot:
-        plt.figure(figsize=(8, 6))
+        fig = plt.figure(figsize=(8, 6))
         plt.hist(density.flatten()[density.flatten()>0], bins=30, density=True)
         plt.xlabel('Points per 100x100 meter grid cell')
         plt.ylabel('Frequency')
         plt.title('Data Density Distribution')
-        plt.show()
+        if save_path:
+            fig.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.close(fig)
+        else:
+            plt.show()
         
        
     return ave_density

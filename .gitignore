@@ -8,6 +8,9 @@ results/
 *.zip
 *.ipynb
 *.png
+*.npy
+*.ipynb
+*.pickle
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

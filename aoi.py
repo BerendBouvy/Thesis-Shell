@@ -27,17 +27,28 @@ class AreaOfInterest:
         gdf = gpd.GeoDataFrame(index=[0], crs=self.crs, geometry=[polygon])
         return gdf
     
-    def plot_aoi(self):
+    def plot_aoi(self, save_path=None):
+        """Plot the AOI boundary and coastline.
+
+        If `save_path` is provided, the figure is saved and not shown.
+        """
         # Plot the AOI and coastline
         fig, ax = plt.subplots()
         ax = plt.axes(projection=ccrs.PlateCarree())
         self.aoi_gdf.to_crs(epsg=4326).plot(ax=ax, facecolor='none', edgecolor='red', linewidth=2)
         ax.coastlines(resolution='10m')
-        ax.set_title("Area of Interest")       
+        ax.set_title("Area of Interest")
+        if save_path:
+            fig.savefig(save_path, dpi=300, bbox_inches='tight')
+            plt.close(fig)
         return fig, ax
         
         
-    def get_raster(self, dataloaders, delta_x=1000, delta_y=1000, plot=False, normalize=True):
+    def get_raster(self, dataloaders, delta_x=1000, delta_y=1000, plot=False, normalize=True, save_path=None):
+        """Build a density/count raster over the AOI and write it to GeoTIFF.
+
+        If `plot` is True and `save_path` is provided, the diagnostic plot is saved and not shown.
+        """
         # Generate a raster grid within the AOI with specified spacing
         bounds = self.aoi_gdf.total_bounds  # minx, miny, maxx, maxy
         x_min, y_min, x_max, y_max = bounds
@@ -90,7 +101,11 @@ class AreaOfInterest:
             ax.set_ylabel("Northing (m)")
             ticks = np.arange(0, max_bin)
             fig.colorbar(img, ax=ax, label=label, orientation='horizontal', boundaries=boundaries, ticks=ticks)
-            plt.show()
+            if save_path:
+                fig.savefig(save_path, dpi=300, bbox_inches='tight')
+                plt.close(fig)
+            else:
+                plt.show()
             
         # Save raster to file (normalized or raw based on flag)
         raster_path = "data_density_raster.tif" if normalize else "data_count_raster.tif"
@@ -109,7 +124,11 @@ class AreaOfInterest:
         ) as dst:
             dst.write(raster_flipped, 1)    
             
-    def plot_dls(self, dataloaders, location, width=1000, height=1000):
+    def plot_dls(self, dataloaders, location, width=1000, height=1000, save_path=None):
+        """Plot rasters from dataloaders that intersect a bounding box.
+
+        If `save_path` is provided, the figure is saved and not shown.
+        """
         bbox = (location[0] - width/2, 
                 location[1] - height/2,
                 location[0] + width/2,
@@ -168,8 +187,12 @@ class AreaOfInterest:
         for ax in axes[n:]:
             ax.axis('off')
         fig.tight_layout()
-        fig.savefig("dataloaders_in_bbox.png", dpi=300)
-        plt.show()
+        target = save_path or "dataloaders_in_bbox.png"
+        fig.savefig(target, dpi=300)
+        if save_path:
+            plt.close(fig)
+        else:
+            plt.show()
         
                 
     def get_dimensions(self):
@@ -178,7 +201,11 @@ class AreaOfInterest:
         height = bounds[3] - bounds[1]
         return width, height
          
-def hist():
+def hist(save_path=None):
+    """Plot a histogram of values from `data_count_raster.tif`.
+
+    If `save_path` is provided, the figure is saved and not shown.
+    """
     # open the tif and plot histogram
     with rasterio.open("data_count_raster.tif") as src:
         raster_data = src.read(1)
@@ -186,7 +213,11 @@ def hist():
     plt.title("Histogram of Data Density Raster")
     plt.xlabel("Density")
     plt.ylabel("Frequency")
-    plt.show()
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+    else:
+        plt.show()
     
     # print statistics
     print("Raster Statistics:")

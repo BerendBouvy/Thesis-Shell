@@ -23,7 +23,7 @@ def grid_heatmap(
         ax: Optional matplotlib axes; if None a new figure/axes is created.
         cmap: Colormap used for the heatmap.
         show: When True, call plt.show() after plotting.
-        save_path: If provided, save the figure to this path.
+        save_path: If provided, save the figure to this path and do not show it.
 
     Returns:
         counts: 2D array with point counts per grid cell (lat x lon).
@@ -67,7 +67,9 @@ def grid_heatmap(
 
     if save_path:
         (fig or ax.figure).savefig(save_path, bbox_inches="tight", dpi=300)
-    if show:
+        if fig is not None:
+            plt.close(fig)
+    elif show:
         plt.show()
     elif fig is not None:
         plt.close(fig)

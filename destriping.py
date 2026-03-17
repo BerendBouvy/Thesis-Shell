@@ -22,9 +22,25 @@ from dataloader import DataLoader
 import os
 
 
-def destripe_raster(raster, trend_param=3, plot=False, style='line', width=5, pad_style='wrap', detrend = 'gaussian', save_plot=None):
-    if not os.path.exists(save_plot):
-        os.makedirs(save_plot)
+def destripe_raster(
+    raster,
+    trend_param=3,
+    plot=False,
+    style='line',
+    width=5,
+    pad_style='wrap',
+    detrend='gaussian',
+    save_plot=None,
+    save_path=None,
+):
+    """Destripe a raster using detrending and frequency-domain filtering.
+
+    Plot diagnostics are saved to `save_path` (or `save_plot` for compatibility)
+    and are not shown interactively.
+    """
+    target_dir = save_path or save_plot
+    if target_dir and not os.path.exists(target_dir):
+        os.makedirs(target_dir)
     nan_index = np.isnan(raster)
     while np.isnan(raster).any():
         print("NaN values detected in raster. Applying smooth interpolation to fill NaNs before destriping.")
@@ -39,13 +55,13 @@ def destripe_raster(raster, trend_param=3, plot=False, style='line', width=5, pa
     #         raster, nan_index2 = fill_nans_zero(raster)
     #         nan_index = nan_index | nan_index2
     if detrend == 'polynomial':
-        fit, residuals = polynomial_fit(raster, degree=trend_param, plot=plot, save_plot=save_plot)
+        fit, residuals = polynomial_fit(raster, degree=trend_param, plot=plot, save_plot=save_plot, save_path=save_path)
     elif detrend == 'gaussian':
-        residuals, fit = detrend_gaussian(raster, sigma=trend_param, plot=plot, save_plot=save_plot)
+        residuals, fit = detrend_gaussian(raster, sigma=trend_param, plot=plot, save_plot=save_plot, save_path=save_path)
     padded_residuals, unpadded_slice = apply_padding(residuals, style=pad_style)
-    F = apply_fft(padded_residuals, plot=plot, save_plot=save_plot)
+    F = apply_fft(padded_residuals, plot=plot, save_plot=save_plot, save_path=save_path)
     notch = create_notch(padded_residuals, width=width, style=style)
-    angle, _ = find_angle(F, notch, step=1, plot=plot, save_plot=save_plot)
+    angle, _ = find_angle(F, notch, step=1, plot=plot, save_plot=save_plot, save_path=save_path)
     F_rotated = ndimage.rotate(F, angle=angle, reshape=False)
     F_filtered = F_rotated * (1 - notch)
     F_unrotated = ndimage.rotate(F_filtered, angle=-angle, reshape=False)
@@ -78,8 +94,8 @@ def destripe_raster(raster, trend_param=3, plot=False, style='line', width=5, pa
         plt.imshow(raster - destriped, origin='lower', cmap=cmocean.cm.deep, vmin=residual_vmin, vmax=residual_vmax)
         plt.colorbar()
         plt.tight_layout()
-        if save_plot:
-            plt.savefig(os.path.join(save_plot, f"destriped.png"), dpi=300, bbox_inches='tight')
+        if target_dir:
+            plt.savefig(os.path.join(target_dir, "destriped.png"), dpi=300, bbox_inches='tight')
         plt.close()
             
         plt.figure(figsize=(12, 6))
@@ -96,13 +112,18 @@ def destripe_raster(raster, trend_param=3, plot=False, style='line', width=5, pa
         plt.imshow(residuals - filtered_residuals_unpadded, origin='lower', cmap=cmocean.cm.deep, vmin=residual_vmin, vmax=residual_vmax)
         plt.colorbar()
         plt.tight_layout()
-        if save_plot:
-            plt.savefig(os.path.join(save_plot, f"residuals_comparison.png"), dpi=300, bbox_inches='tight')     
+        if target_dir:
+            plt.savefig(os.path.join(target_dir, "residuals_comparison.png"), dpi=300, bbox_inches='tight')
         plt.close()
 
     return destriped
 
-def polynomial_fit(data, degree=3, plot=False, save_plot=None):
+def polynomial_fit(data, degree=3, plot=False, save_plot=None, save_path=None):
+    """Fit polynomial surface and return fit plus residuals.
+
+    If `plot` is True, outputs are saved (not shown) when `save_path` is provided.
+    """
+    target_dir = save_path or save_plot
     x = np.arange(data.shape[1])
     y = np.arange(data.shape[0])
     X, Y = np.meshgrid(x, y)
@@ -144,14 +165,19 @@ def polynomial_fit(data, degree=3, plot=False, save_plot=None):
         plt.colorbar()
         
         plt.tight_layout()
-        if save_plot:
-            plt.savefig(os.path.join(save_plot, f"polynomial_fit_degree_{degree}.png"), dpi=300, bbox_inches='tight')
+        if target_dir:
+            plt.savefig(os.path.join(target_dir, f"polynomial_fit_degree_{degree}.png"), dpi=300, bbox_inches='tight')
         plt.close()
   
 
     return Z_fit, residuals
 
-def detrend_gaussian(data, sigma=50, plot=False, save_plot=None):
+def detrend_gaussian(data, sigma=50, plot=False, save_plot=None, save_path=None):
+    """Apply Gaussian detrending and return detrended data and trend.
+
+    If `plot` is True, outputs are saved (not shown) when `save_path` is provided.
+    """
+    target_dir = save_path or save_plot
     trend = ndimage.gaussian_filter(data, sigma=sigma)
     detrended = data - trend
     if plot:
@@ -172,8 +198,8 @@ def detrend_gaussian(data, sigma=50, plot=False, save_plot=None):
         plt.colorbar()
         
         plt.tight_layout()
-        if save_plot:
-            plt.savefig(os.path.join(save_plot, f"gaussian_detrend_sigma_{sigma}.png"), dpi=300, bbox_inches='tight')
+        if target_dir:
+            plt.savefig(os.path.join(target_dir, f"gaussian_detrend_sigma_{sigma}.png"), dpi=300, bbox_inches='tight')
         plt.close()
  
     return detrended, trend
@@ -187,7 +213,12 @@ def create_notch(data, width=5, style='cross'):
     notch[notch_y//2-width:notch_y//2+width, notch_x//2-width:notch_x//2+width] = 0
     return notch
 
-def apply_fft(data, plot=False, save_plot=None):
+def apply_fft(data, plot=False, save_plot=None, save_path=None):
+    """Compute shifted FFT and optionally create a magnitude diagnostic plot.
+
+    If `plot` is True, outputs are saved (not shown) when `save_path` is provided.
+    """
+    target_dir = save_path or save_plot
     F = np.fft.fft2(data)
     F_shifted = np.fft.fftshift(F)
     
@@ -204,8 +235,8 @@ def apply_fft(data, plot=False, save_plot=None):
         plt.colorbar()
         
         plt.tight_layout()
-        if save_plot:
-            plt.savefig(os.path.join(save_plot, f"fft_magnitude.png"), dpi=300, bbox_inches='tight')
+        if target_dir:
+            plt.savefig(os.path.join(target_dir, "fft_magnitude.png"), dpi=300, bbox_inches='tight')
         plt.close()
 
     return F_shifted
@@ -220,7 +251,12 @@ def apply_padding(data, style='wrap'):
 def unpad_data(data_padded, unpadded_slice):
     return data_padded[unpadded_slice]
 
-def find_angle(F, notch, step=1, plot=False, save_plot=None):
+def find_angle(F, notch, step=1, plot=False, save_plot=None, save_path=None):
+    """Find the best stripe angle response for a given notch mask.
+
+    If `plot` is True, outputs are saved (not shown) when `save_path` is provided.
+    """
+    target_dir = save_path or save_plot
     amplitude = np.log(np.abs(F) + 1)
     angle = 0
     response = 0
@@ -246,8 +282,8 @@ def find_angle(F, notch, step=1, plot=False, save_plot=None):
         plt.colorbar()
         
         plt.tight_layout()
-        if save_plot:
-            plt.savefig(os.path.join(save_plot, f"angle_detection.png"), dpi=300, bbox_inches='tight')
+        if target_dir:
+            plt.savefig(os.path.join(target_dir, "angle_detection.png"), dpi=300, bbox_inches='tight')
         plt.close()
     
     return angle, response
