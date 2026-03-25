@@ -1,5 +1,4 @@
 import pickle
-
 from difClass import DifferenceRaster, BathymetryRaster
 import numpy as np
 import os
@@ -7,8 +6,59 @@ import matplotlib.pyplot as plt
 from sklearn.cluster import KMeans
 import cmocean
 from matplotlib.colors import ListedColormap, BoundaryNorm
-from scipy.ndimage import gaussian_filter
+from scipy.ndimage import gaussian_filter, binary_closing, binary_fill_holes, label
 import time
+from k_means_constrained import KMeansConstrained
+from sklearn.preprocessing import StandardScaler
+
+
+def clean_smoothed_labels(
+    labels,
+    valid_mask,
+    sigma=20,
+    threshold=0.05,
+    closing_iterations=2,
+    min_cluster_pixels=200,
+):
+    """Smooth labels, bridge small gaps, and remove tiny connected components."""
+    # Smooth only within valid pixels and normalize by local valid support so
+    # edges are not artificially pulled toward zero.
+    labels_f = labels.astype(np.float32)
+    valid_f = valid_mask.astype(np.float32)
+    weighted = gaussian_filter(labels_f * valid_f, sigma=sigma, mode="nearest")
+    support = gaussian_filter(valid_f, sigma=sigma, mode="nearest")
+    smoothed = np.divide(
+        weighted,
+        support,
+        out=np.zeros_like(weighted, dtype=np.float32),
+        where=support > 1e-6,
+    )
+    binary = smoothed > threshold
+    binary &= valid_mask
+
+    # Connect nearby fragments and fill small internal voids.
+    # Keep edge-connected foreground from being eroded by implicit 0-padding at
+    # array boundaries during closing.
+    binary = binary_closing(
+        binary,
+        structure=np.ones((3, 3), dtype=bool),
+        iterations=closing_iterations,
+        border_value=1,
+    )
+    binary = binary_fill_holes(binary)
+
+    # Remove tiny outlier islands to keep only larger segmentations.
+    labeled_components, n_components = label(binary)
+    if n_components > 0:
+        component_sizes = np.bincount(labeled_components.ravel())
+        keep = component_sizes >= min_cluster_pixels
+        keep[0] = False
+        binary = keep[labeled_components]
+
+    output = np.zeros_like(labels, dtype=np.int8)
+    output[binary] = 1
+    output[~valid_mask] = -1
+    return output
 
 def main():
     start = time.time()
@@ -59,23 +109,35 @@ def main():
     
 def main2():
     folder = "sandwave_detection_v8"
+    if not os.path.exists(os.path.join(folder, "labels")):
+        os.makedirs(os.path.join(folder, "labels"))
     results = pickle.load(open(os.path.join(folder, "results_features.pkl"), "rb"))
+    ss = StandardScaler()
     for id in results.keys():
         results[id]["feat"] = np.stack(
             [
-                results[id]["residual"].flatten(),
-                results[id]["std"].flatten(),
-                results[id]["grad"].flatten(),
-                results[id]["grad_of_grad"].flatten(),
-                results[id]["min"].flatten(),
-                results[id]["max"].flatten()
+                np.abs(results[id]["residual"].flatten())**.5,
+                results[id]["std"].flatten()**0.5,
+                np.abs(results[id]["grad"].flatten())**.5,
+                np.abs(results[id]["grad_of_grad"].flatten())**.5,
+                # results[id]["min"].flatten()**2,
+                # results[id]["max"].flatten()**2
             ]
         )
     time1 = time.time()
     
     features = np.concatenate([results[key]["feat"] for key in results.keys()], axis=1).T
-    kmeans = KMeans(n_clusters=2, random_state=0).fit(features)
+    ss.fit(features)
+    features = ss.transform(features)
+    min_cluster_size = int(features.shape[0] * 0.05)
+    # kmeans = KMeans(n_clusters=2, random_state=0).fit(features)
+    print("Start clustering")
+    kmeans = KMeansConstrained(n_clusters=2, size_min=min_cluster_size, random_state=0, verbose=True, n_init=1, tol=1e-3)
+    kmeans.fit(features)
     time2 = time.time()
+    # make sure that 0 is larger cluster and 1 is smaller cluster
+    if np.sum(kmeans.labels_ == 0) < np.sum(kmeans.labels_ == 1):
+        kmeans.labels_ = 1 - kmeans.labels_
     print(f"KMeans clustering completed in {time2 - time1:.2f} seconds.") 
     cmap = ListedColormap(['white', 'red', 'blue'])
     norm = BoundaryNorm([-1.5, -0.5, 0.5, 1.5], cmap.N)
@@ -83,10 +145,16 @@ def main2():
     for key in results.keys():
         n_pixels = results[key]["feat"].shape[1]
         results[key]["labels"] = kmeans.labels_[idx:idx+n_pixels].reshape(results[key]["filled"].shape)
-        results[key]["labels_smoothed"] = gaussian_filter(results[key]["labels"].astype(np.float32), sigma=40)
-        results[key]["labels_smoothed"] = np.where(results[key]["labels_smoothed"] > 0.2, 1, 0)
+        valid_mask = ~results[key]["bathymetry"].nan_mask
+        results[key]["labels_smoothed"] = clean_smoothed_labels(
+            results[key]["labels"],
+            valid_mask=valid_mask,
+            sigma=20,
+            threshold=0.05,
+            closing_iterations=2,
+            min_cluster_pixels=200,
+        )
         results[key]["labels"][results[key]["bathymetry"].nan_mask] = -1
-        results[key]["labels_smoothed"][results[key]["bathymetry"].nan_mask] = -1
         idx += n_pixels
     
     
@@ -94,19 +162,24 @@ def main2():
     for key in results.keys():
         plt.figure(figsize=(18, 6))
         plt.subplot(1, 3, 1)
-        plt.imshow(results[key]["original"], cmap=cmocean.cm.deep, origin='lower')
+        plt.imshow(results[key]["original"], cmap=cmocean.cm.deep, origin='upper')
         plt.colorbar()
         plt.title(f"Original Raster \n {key}")
         plt.subplot(1, 3, 2)
-        plt.imshow(results[key]["labels"], cmap=cmap, norm=norm, origin='lower')
+        plt.imshow(results[key]["labels"], cmap=cmap, norm=norm, origin='upper')
         plt.colorbar()
         plt.title(f"KMeans Clusters \n {key}")
         plt.subplot(1, 3, 3)
-        plt.imshow(results[key]["labels_smoothed"], cmap=cmap, norm=norm, origin='lower')
+        plt.imshow(results[key]["labels_smoothed"], cmap=cmap, norm=norm, origin='upper')
         plt.colorbar()
         plt.title(f"Smoothed KMeans Clusters \n {key}")
         plt.savefig(os.path.join(folder, f"{key}_clusters.png"), dpi=300, bbox_inches='tight')
+        print(f"Saved cluster at {os.path.join(folder, f'{key}_clusters.png')}")
         plt.close()
+        
+        # save (smoothed) labels
+        np.save(os.path.join(folder, "labels", f"{key}_labels.npy"), results[key]["labels"])
+        np.save(os.path.join(folder, "labels", f"{key}_labels_smoothed.npy"), results[key]["labels_smoothed"])
         
     if len(os.listdir(folder)) == 0:
         os.rmdir(folder)    

@@ -9,6 +9,7 @@ from shapely.geometry import Polygon
 import time 
 from destripeClass import Destriper
 import cmocean
+import geopandas as gpd
 
 
 def analyse(cell_corners, save_path=None):
@@ -188,6 +189,17 @@ def test():
        
     return
 
+def npraster_to_coordinates(raster, cell, cell_corners, cell_size=5000, cell_resolution=20):
+    """Convert raster pixel indices to UTM coordinates based on cell location."""
+    x_start, y_start = cell_corners[cell]
+    geodf = gpd.GeoDataFrame(
+        geometry=gpd.points_from_xy(
+            x_start + (np.arange(raster.shape[1]) + 0.5) * cell_resolution,
+            y_start + (np.arange(raster.shape[0]) + 0.5) * cell_resolution
+        ),
+        crs="EPSG:32631"  # UTM zone 31N
+    )
+    return geodf
 
 if __name__ == "__main__":
     start = time.time()

@@ -229,10 +229,10 @@ def hist(save_path=None):
 if __name__ == "__main__":
     # Example usage
     aoi = AreaOfInterest("AOI.txt")
-    with open("data_loaders_v2.pkl", "rb") as f:
-        dataloaders = pickle.load(f)
-        print(f"Loaded {len(dataloaders)} data loaders from pickle.")
-    aoi.plot_dls(dataloaders, location=(604483, 5919580), width=2000, height=2000)
+    # with open("data_loaders_v2.pkl", "rb") as f:
+    #     dataloaders = pickle.load(f)
+    #     print(f"Loaded {len(dataloaders)} data loaders from pickle.")
+    # aoi.plot_dls(dataloaders, location=(604483, 5919580), width=2000, height=2000)
     
     
     # aoi.get_raster(dataloaders, delta_x=100, delta_y=100, plot=True, normalize=False)   
