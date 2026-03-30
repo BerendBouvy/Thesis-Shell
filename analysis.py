@@ -190,12 +190,17 @@ def test():
     return
 
 def npraster_to_coordinates(raster, cell, cell_corners, cell_size=5000, cell_resolution=20):
-    """Convert raster pixel indices to UTM coordinates based on cell location."""
+    """Convert raster pixel indices to UTM coordinates based on cell location.
+    
+    Maps pixel centers to UTM coords, accounting for imshow(origin='upper') vertical flip:
+    - Row 0 (displayed top/north) → highest Y
+    - Row N-1 (displayed bottom/south) → lowest Y
+    """
     x_start, y_start = cell_corners[cell]
-    geodf = gpd.GeoDataFrame(
+    geodf = gpd.GeoDataFrame(raster,
         geometry=gpd.points_from_xy(
             x_start + (np.arange(raster.shape[1]) + 0.5) * cell_resolution,
-            y_start + (np.arange(raster.shape[0]) + 0.5) * cell_resolution
+            y_start + cell_size - (np.arange(raster.shape[0]) + 0.5) * cell_resolution
         ),
         crs="EPSG:32631"  # UTM zone 31N
     )

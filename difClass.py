@@ -1,24 +1,28 @@
 import numpy as np
 from scipy import ndimage
 import scipy.signal as signal
-from scipy.ndimage import gaussian_filter, generic_filter, sobel, minimum_filter, maximum_filter, distance_transform_edt
+from scipy.ndimage import gaussian_filter, generic_filter, sobel, minimum_filter, maximum_filter, distance_transform_edt, rotate
 import cmocean
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.linear_model import LinearRegression
 from sklearn.cluster import KMeans
+import os
+
+sandwave_detection_folder = os.path.join("sandwave_detection_v8", "labels")
 
 class RasterBase:
     """Base class for raster processing shared by bathymetry and difference rasters."""
 
-    def __init__(self, raster, pixel_size=20):
-        self.raster = raster
+    def __init__(self, cell, cdi, pixel_size=20):
+        self.cell = cell
+        self.cdi = cdi
+        self.raster = np.load(f"destriped_rasters/cell_{cell}_CDI_{cdi}_destriped.npy")
         self.pixel_size = pixel_size
-        self.mean = np.nanmean(raster)
-        self.raster_demeaned = raster - self.mean
+        self.mean = np.nanmean(self.raster)
+        self.raster_demeaned = self.raster - self.mean
         self.raster_fill()
-        
-        
+            
     def raster_fill(self, zero_fill=False):
         # Fill NaN values with the mean of the raster for FFT processing
         self.nan_mask = np.isnan(self.raster_demeaned)
@@ -43,18 +47,54 @@ class RasterBase:
         # Compute magnitude spectrum
         self.magnitude_spectrum = np.log(np.abs(self.fft_shifted) + 1)  # Add 1 to avoid log(0)
         
-    def find_angle(self):
+    def find_angle(self, notch_angle=15):
         if not hasattr(self, "magnitude_spectrum"):
             self.analyse_spectrum()
 
-        notch = np.eye(self.magnitude_spectrum.shape[0])
-        angles = np.arange(0, 180, 1)
+        notch = self.cone_notch(self.magnitude_spectrum.shape[0], angle=notch_angle)
+        angles = np.arange(0, 180, 5)
         responses = []
+        
         
         for angle in angles:
             rotated_notch = ndimage.rotate(notch, angle, reshape=False)
-            response = np.sum(self.magnitude_spectrum * rotated_notch)
+            response = np.sum(self.magnitude_spectrum * rotated_notch)/np.sum(rotated_notch)
             responses.append(response)
+            
+            plt.figure(figsize=(6, 6))
+            plt.imshow(rotated_notch, cmap='gray')
+            plt.title(f"Rotated Notch at {angle} degrees")
+            plt.savefig(f"temp/notch_{angle}.png", dpi=300, bbox_inches='tight')
+            plt.close()
+            
+        plt.figure(figsize=(10, 5))
+        plt.plot(angles, responses, marker='o')
+        plt.xlabel('Angle (degrees)')
+        plt.ylabel('Response')
+        plt.title('Response vs Angle')
+        plt.grid(True)
+        plt.show()
+        
+        best_angle = angles[np.argmax(responses)]
+        best_angle_north = (180 - best_angle - 45)%360
+        best_response = np.max(responses)
+        
+        self.best_angle = best_angle
+        self.best_angle_north = best_angle_north
+        
+        best_notch = ndimage.rotate(notch, best_angle, reshape=False)
+        fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+        ax[0].imshow(self.magnitude_spectrum, cmap=cmocean.cm.deep)
+        ax[0].set_title("Magnitude Spectrum")
+        ax[0].set_xlabel("Frequency X")
+        ax[0].set_ylabel("Frequency Y")
+        ax[1].imshow(best_notch*self.magnitude_spectrum, cmap=cmocean.cm.deep)
+        ax[1].set_title(f"Best Notch at {best_angle_north} degrees\nResponse: {best_response:.2f}")
+        ax[1].set_xlabel("Frequency X")
+        ax[1].set_ylabel("Frequency Y")
+        plt.tight_layout()
+        plt.show()   
+                           
             
         return angles, responses
     
@@ -172,9 +212,8 @@ class RasterBase:
     @staticmethod
     def window_and_pad(raster, pad_width=None):
         if pad_width is None:
-            # Nearest power of 2 for padding
-            size = 2**int(np.ceil(np.log2(raster.shape[0]))) - raster.shape[0]
-            pad_width = [(size, size), (size, size)]
+            shape = raster.shape
+            pad_width = [(shape[0], shape[0]), (shape[1], shape[1])]
             
         # Apply window function
         window1d = signal.windows.hann(raster.shape[0])
@@ -187,66 +226,62 @@ class RasterBase:
         
         return raster_padded, window2d
 
+    @staticmethod
+    def plot_spectrum(self, title="Magnitude Spectrum", show=False, save_path=None):
+        if not hasattr(self, "magnitude_spectrum"):
+            self.analyse_spectrum()
+        self.plot_raster(self.magnitude_spectrum, title=title, show=show, save_path=save_path)
 
+    @staticmethod
+    def cone_notch(size, angle=15):
+        trile = np.tril(np.ones((size, size)), k=0)
+        trile_rotated1 = rotate(trile, angle, reshape=False, order=1, mode='reflect')
+        trile_rotated2 = rotate(trile, -angle, reshape=False, order=1, mode='reflect')
+        trile_combined = np.abs(trile_rotated2 - trile_rotated1)
+        return trile_combined
+        
+    
 class BathymetryRaster(RasterBase):
     """Raster class for single bathymetry surfaces."""
     
-    def __init__(self, raster, pixel_size=20):
-        super().__init__(raster, pixel_size)
+    def __init__(self, cell, cdi, pixel_size=20):
+        super().__init__(cell=cell, cdi=cdi, pixel_size=pixel_size)
         self.detrend()
         
-        # self.raster_filled = self.residual.copy()
-
     def detrend(self, sigma=30):
         """Remove large-scale trend and store residuals."""
         self.trend = gaussian_filter(self.raster_filled, sigma=sigma)
         self.residual = self.raster_filled - self.trend
         return self.residual
     
-    def cluster_sandwaves(self, raster):
-        """Use local features and KMeans to classify sandwave vs non-sandwave areas."""        
-        std_raster = self.local_std(raster, size=10)
-        grad_raster = self.local_gradient(raster, smooth=5)
-        # grad_of_grad_raster = self.local_gradient(grad_raster, smooth=1)
-        min_raster, max_raster = self.local_minmax(raster, size=15)
-        
-        # rasters = [std_raster, grad_raster, grad_of_grad_raster, min_raster, max_raster]
-        rasters = [std_raster, grad_raster]
-        
-        features = np.stack([i.flatten() for i in rasters], axis=1)
-        
-        kmeans = KMeans(n_clusters=2, random_state=0).fit(features)
-        labels = kmeans.labels_.reshape(raster.shape)
-        labels[self.nan_mask] = -1  # Mark NaN areas with a separate label
-        return labels, rasters
-        
-    @staticmethod
-    def local_std(raster, size=5):
-        """Compute local standard deviation as a rough measure of roughness."""
-        local_std_raster = generic_filter(raster, np.nanstd, size=size)
-        return local_std_raster
+    def get_cluster(self):
+        path = os.path.join(sandwave_detection_folder, f"cell_{self.cell}_CDI_{self.cdi}_destriped_labels_smoothed.npy")
+        self.cluster_labels = np.load(path)
+        self.sw_ratio = np.nanmean(self.cluster_labels)
+        return self.cluster_labels
     
-    @staticmethod
-    def local_gradient(raster, smooth=None):
-        """Compute local gradient magnitude using Sobel filters."""
-        gradient = np.sqrt(sobel(raster, axis=0)**2 + sobel(raster, axis=1)**2)
-        if smooth is not None:
-            gradient = gaussian_filter(gradient, sigma=smooth)
-        return gradient
+    def set_angle(self, angle):
+        self.angle = angle
+    
+    def find_best_cross(self):
+        if not hasattr(self, "cluster_labels"):
+            self.get_cluster()
+        if not hasattr(self, "angle"):
+            self.find_angle()
+            self.set_angle(self.best_angle_north)
 
-    @staticmethod
-    def local_minmax(raster, size=15):
-        """Compute local minima and maxima using minimum and maximum filters."""
-        local_min = minimum_filter(raster, size=size)
-        local_max = maximum_filter(raster, size=size)
-        return local_min, local_max
-
+    
 class DifferenceRaster(RasterBase):
     """Raster class for differences between two bathymetry surfaces."""
-    def __init__(self, raster, raster2, pixel_size=20):
-        self.raster1 = raster
+    def __init__(self, raster1, raster2, pixel_size=20):
+        self.raster1 = raster1
         self.raster2 = raster2
+        self.mean1 = np.nanmean(raster1)
+        self.mean2 = np.nanmean(raster2)
+        self.raster1_demeaned = self.raster1 - self.mean1
+        self.raster2_demeaned = self.raster2 - self.mean2
         self.raster = self.raster1 - self.raster2
+        self.raster_demeaned = self.raster1_demeaned - self.raster2_demeaned
         super().__init__(self.raster, pixel_size)
     
 
@@ -259,15 +294,15 @@ class DifferenceRaster(RasterBase):
             "p95_abs": float(np.nanpercentile(np.abs(self.raster), 95)),
         }
     
-    def double_cross(self, point1, point2, num=100, plot=False, save_path=None):
+    def double_cross(self, point1, point2, num=100, show=False, save_path=None):
         """Extract cross-sections from both rasters along the same line.
 
-        If `plot` is True and `save_path` is provided, the figure is saved and not shown.
+        If `show` is True and `save_path` is provided, the figure is saved and not shown.
         """
         values1, length = self.cross_section(self.raster1, point1, point2, num=num)
         values2, _ = self.cross_section(self.raster2, point1, point2, num=num)
         
-        if plot:
+        if show:
             plt.figure(figsize=(10, 5))
             plt.subplot(1, 2, 2)
             plt.imshow(self.raster, cmap=cmocean.cm.deep, origin='upper')
@@ -311,4 +346,59 @@ class DifferenceRaster(RasterBase):
         else:
             plt.close()
         
+    def minimise_shift(self, x_max=30, y_max=30, show=False, save_path=None):
+        """Find optimal shift between rasters by minimizing difference variance."""
+        best_shift = (0, 0)
+        best_mean = np.inf
+        shape = self.raster1_demeaned.shape
+        best_diff=self.raster1_demeaned - self.raster2_demeaned
+        scores = np.zeros((2*y_max+1, 2*x_max+1))
+        for x_shift in range(-x_max, x_max + 1):
+            for y_shift in range(-y_max, y_max + 1):
+                shifted_raster1 = self.raster1_demeaned[max(0, y_shift):min(shape[0], shape[0]+y_shift),
+                                                        max(0, x_shift):min(shape[1], shape[1]+x_shift)]
+                shifted_raster2 = self.raster2_demeaned[max(0, -1*y_shift):min(shape[0], shape[0]+-1*y_shift), 
+                                                        max(0, -1*x_shift):min(shape[1], shape[1]+-1*x_shift)]
+                diff = shifted_raster1 - shifted_raster2
+                mean = np.nanmean(diff)
+                scores[y_shift+y_max, x_shift+x_max] = mean
+                
+                if mean < best_mean:
+                    best_mean = mean
+                    best_shift = (x_shift, y_shift)
+                    best_diff = diff
+        
+        if show or save_path:
+            fig, ax = plt.subplots(1, 4, figsize=(6, 6))
+            ax[0].imshow(self.raster1_demeaned, cmap=cmocean.cm.deep)
+            ax[0].set_title("Raster 1 Demeaned")
+            #draw bbox of shifted area
+            ax[0].add_patch(plt.Rectangle((max(0, best_shift[0]), max(0, best_shift[1])),
+                                        min(shape[1], shape[1]+best_shift[0]), min(shape[0], shape[0]+best_shift[1]),
+                                        fill=False, edgecolor='red', linewidth=2))
+            ax[0].set_xlabel("X (pixels)")
+            ax[0].set_ylabel("Y (pixels)")
+            ax[1].imshow(self.raster2_demeaned, cmap=cmocean.cm.deep)
+            ax[1].set_title("Raster 2 Demeaned")
+            ax[1].add_patch(plt.Rectangle((max(0, -1*best_shift[0]), max(0, -1*best_shift[1])),
+                                        min(shape[1], shape[1]+-1*best_shift[0]), min(shape[0], shape[0]+-1*best_shift[1]),
+                                        fill=False, edgecolor='red', linewidth=2))
+            ax[1].set_xlabel("X (pixels)")
+            ax[1].set_ylabel("Y (pixels)")
+            ax[2].imshow(best_diff, cmap=cmocean.cm.deep)
+            ax[2].set_title("Best Difference")
+            ax[2].set_xlabel("X (pixels)")
+            ax[2].set_ylabel("Y (pixels)")
+            im = ax[3].imshow(scores, cmap='viridis', extent=(-x_max, x_max, -y_max, y_max), origin='upper')
+            ax[3].set_title("Mean Difference by Shift")
+            ax[3].set_xlabel("X Shift (pixels)")
+            ax[3].set_ylabel("Y Shift (pixels)")
+            plt.colorbar(im, ax=ax[3], label='Mean Difference (m)')
+            plt.suptitle(f"Best Shift: {best_shift} pixels, Mean Difference: {best_mean:.2f} m")
+            if save_path:
+                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                plt.close()
+            elif show:
+                plt.show()
+        return best_shift
         

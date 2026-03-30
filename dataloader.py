@@ -90,6 +90,9 @@ class DataLoader:
             plt.colorbar(sc, label='Mean (m)')
             ax.coastlines()
             ax.set_title(f"Data Plot for {self.metadata['LOCAL_CDI_ID']}")
+            ax.set_xlabel('Longitude')
+            ax.set_ylabel('Latitude')
+            
             if bbox:
                 bb = self.get_bounding_box()
                 scatter_points = {
