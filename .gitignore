@@ -9,7 +9,6 @@ results/
 *.ipynb
 *.png
 *.npy
-*.ipynb
 *.pickle
 
 # Byte-compiled / optimized / DLL files
