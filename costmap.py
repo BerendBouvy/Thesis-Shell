@@ -58,6 +58,18 @@ class CostMap:
         else:
             raise IndexError("Cell index out of bounds")
         
+    def multiply_cost(self, x_idx, y_idx, factor, x_idx_end=None, y_idx_end=None):
+        """Multiply the cost for a specific cell in the cost map by a factor."""
+        if x_idx_end is None:
+            x_idx_end = x_idx + 1
+        if y_idx_end is None:
+            y_idx_end = y_idx + 1
+
+        if 0 <= x_idx < self.cm_width and 0 <= y_idx < self.cm_height and 0 < x_idx_end <= self.cm_width and 0 < y_idx_end <= self.cm_height:
+            self.costs[y_idx:y_idx_end, x_idx:x_idx_end] *= factor
+        else:
+            raise IndexError("Cell index out of bounds")
+        
     def get_cost(self, x_idx, y_idx):
         """Get the cost for a specific cell in the cost map."""
         if 0 <= x_idx < self.cm_width and 0 <= y_idx < self.cm_height:
@@ -103,7 +115,10 @@ class CostMap:
                 overlay = np.zeros((*route.shape, 4), dtype=float)
                 overlay[route, :] = plt.matplotlib.colors.to_rgba(color, alpha=0.9)
                 ax.imshow(overlay, origin='lower')
-                legend_handles.append(Patch(color=color, label=f"Route {i + 1}"))
+                route_cost = float(self.costs[route].sum())
+                legend_handles.append(
+                    Patch(color=color, label=f"Route {i + 1}  (cost: {route_cost:.1f})")
+                )
             if legend_handles:
                 ax.legend(handles=legend_handles, loc="upper right", fontsize=8)
 
@@ -232,6 +247,21 @@ class CostMap:
             self.routes.append(skeleton)
 
         return self.routes
+    
+    def fill_nans_nn(self):
+        """Fill NaN values in the cost map using nearest neighbor interpolation."""
+        nan_mask = np.isnan(self.costs)
+        if not nan_mask.any():
+            return
+
+        rows, cols = np.indices(self.costs.shape)
+        valid = ~nan_mask
+        from scipy.spatial import cKDTree
+        tree = cKDTree(np.column_stack([rows[valid], cols[valid]]))
+        _, idx = tree.query(np.column_stack([rows[nan_mask], cols[nan_mask]]))
+        valid_values = self.costs[valid]
+        self.costs[nan_mask] = valid_values[idx]
+
 
 
 if __name__ == "__main__":

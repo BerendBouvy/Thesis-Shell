@@ -7,33 +7,39 @@ import os
 import numpy as np
 
 rasters_path = "sandwave_detection_v8/labels"
+sand_wave_ratio = 4
 
 def run():
-    costmap = cm.CostMap(dx=100, dy=100, default_cost=1)
+    
+    costmap = cm.CostMap(dx=100, dy=100, default_cost=np.nan)
     files = [f for f in os.listdir(rasters_path) if f.endswith("destriped_labels_smoothed.npy")]
     raster_dict = {}
     for file in files:
         id = file.split('_')[1]
         raster = np.load(os.path.join(rasters_path, file))[::-1, :]
         raster = raster.astype(float)
-        # raster[raster==-1] = np.nan
+        raster[raster==-1] = np.nan
         if id not in raster_dict:
             raster_dict[id] = []
         raster_dict[id].append(raster)
     
     for id, rasters in raster_dict.items():
-        avg_raster = combine_rasters(rasters, func=np.nanmax)
+        avg_raster = combine_rasters(rasters, func=np.nanmean)
         rescaled_raster = ski.measure.block_reduce(
             avg_raster, 
             block_size=5,
             func=np.max
         )
         x_start, x_end, y_start, y_end = costmap.slice_cost_map(int(id))
-        costmap.add_cost(x_start, y_start, cost=rescaled_raster, x_idx_end=x_end, y_idx_end=y_end)
+        costmap.set_cost(x_start, y_start, cost=np.ones((y_end - y_start, x_end - x_start)), x_idx_end=x_end, y_idx_end=y_end)
+        costmap.add_cost(x_start, y_start, cost=rescaled_raster*sand_wave_ratio, x_idx_end=x_end, y_idx_end=y_end)
+        # costmap.multiply_cost(x_start, y_start, factor=rescaled_raster, x_idx_end=x_end, y_idx_end=y_end)
     
     costmap.block_n2000()
     costmap.plot_cost_map(cmap='viridis', show=True, show_routes=True)
-    rescale_factor = 10
+    costmap.fill_nans_nn()
+    costmap.plot_cost_map(cmap='viridis', show=True, show_routes=True)
+    rescale_factor = 1
     cmap_rescaled = ski.measure.block_reduce(
         costmap.costs,
         block_size=rescale_factor,
@@ -68,7 +74,7 @@ def run():
     if result is not None:
         print(result)
         print(f"Nodes expanded: {len(record.expansions)}")
-        record.animate(step=10, interval=5)        
+        record.animate(step=2000, interval=0, route=costmap.routes[1])        
         
 def combine_rasters(rasters, func=np.nanmean):
     """Combine multiple rasters using a specified function while ignoring NaN values."""

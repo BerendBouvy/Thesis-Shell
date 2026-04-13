@@ -407,6 +407,7 @@ class ExplorationRecord:
         interval: int = 30,
         max_scatter_pts: int = 5_000,
         show_path_trace: Optional[bool] = None,
+        route: Optional[np.ndarray] = None,
     ) -> mpl_animation.FuncAnimation:
         """
         Open an interactive matplotlib window to replay the A* search.
@@ -430,6 +431,14 @@ class ExplorationRecord:
             each frame.  Tracing requires a came_from traversal per frame and
             can be slow for large grids.
             None (default) = enabled only when n_exp <= 200 000.
+        route : np.ndarray or None
+            Optional boolean mask (same shape as cost_grid) representing a
+            reference route (e.g. an element of CostMap.routes).  When given:
+            - The route is drawn as a yellow overlay on the map in every frame.
+            - Its total cost is shown as a horizontal dashed line in the upper-
+              right plot (comparable to the A* solution cost line).
+            - Its cumulative cost along the route (ordered greedily from start)
+              is plotted in the lower-right plot.
         """
         rows, cols = self.cost_grid.shape
         n_exp = len(self.expansions)
@@ -463,6 +472,35 @@ class ExplorationRecord:
         ax_map.imshow(self.cost_grid, cmap="gray", origin="lower", alpha=0.75)
         ax_map.plot(self.start[1], self.start[0], "go", ms=7, label="Start", zorder=5)
         ax_map.plot(self.goal[1],  self.goal[0],  "r*", ms=11, label="Goal",  zorder=5)
+
+        # ---- reference route overlay (static) -----------------------------
+        route_total_cost = None
+        route_cumulative = None
+        if route is not None:
+            route_overlay = np.zeros((rows, cols, 4), dtype=float)
+            route_overlay[route] = [1.0, 1.0, 0.0, 0.75]   # yellow, semi-transparent
+            ax_map.imshow(route_overlay, origin="lower", zorder=4)
+
+            # Order route cells greedily from the cell nearest to self.start
+            route_coords = np.argwhere(route)   # (N, 2): [row, col]
+            if len(route_coords) > 0:
+                remaining = list(range(len(route_coords)))
+                dists = np.linalg.norm(route_coords - np.array(self.start), axis=1)
+                cur = int(np.argmin(dists))
+                order = [cur]
+                remaining.remove(cur)
+                while remaining:
+                    last = route_coords[order[-1]]
+                    rem_arr = np.array(remaining)
+                    d = np.linalg.norm(route_coords[rem_arr] - last, axis=1)
+                    nearest = remaining[int(np.argmin(d))]
+                    order.append(nearest)
+                    remaining.remove(nearest)
+                ordered_coords = route_coords[order]
+                cell_costs = np.array([self.cost_grid[r, c] for r, c in ordered_coords])
+                route_cumulative = np.cumsum(cell_costs)
+                route_total_cost = float(route_cumulative[-1])
+
         ax_map.legend(loc="upper left", fontsize=8)
         ax_map.set_title("A* Exploration")
 
@@ -506,7 +544,10 @@ class ExplorationRecord:
             fontsize=9,
         )
         ax_cost.set_xlim(0, n_exp)
-        ax_cost.set_ylim(0, float(g_values.max()) * 1.05 if n_exp > 0 else 1)
+        _cost_ymax = float(g_values.max()) if n_exp > 0 else 1.0
+        if route_total_cost is not None:
+            _cost_ymax = max(_cost_ymax, route_total_cost)
+        ax_cost.set_ylim(0, _cost_ymax * 1.05)
         ax_cost.tick_params(labelsize=7)
 
         if max_scatter_pts > 0:
@@ -525,14 +566,21 @@ class ExplorationRecord:
                 self.final_result.total_cost, color="green",
                 lw=1, ls="--", label=f"solution cost {self.final_result.total_cost:.2f}",
             )
+        if route_total_cost is not None:
+            ax_cost.axhline(
+                route_total_cost, color="yellow",
+                lw=1, ls="-.", label=f"ref route cost {route_total_cost:.2f}",
+            )
+        if self.final_result is not None or route_total_cost is not None:
             ax_cost.legend(fontsize=7)
 
         # ---- solution path cost plot (bottom-right) -----------------------
-        ax_path.set_xlabel("Step along solution path", fontsize=8)
+        ax_path.set_xlabel("Step along path", fontsize=8)
         ax_path.set_ylabel("Cumulative cost", fontsize=8)
-        ax_path.set_title("Optimal path — cumulative cost", fontsize=9)
+        ax_path.set_title("Cumulative cost along path", fontsize=9)
         ax_path.tick_params(labelsize=7)
 
+        _path_ymax = 1.0
         if self.final_result is not None:
             sol_keys: List[Tuple[int, int, int]] = [s.as_tuple() for s in self.final_result.states]
             g_lookup: Dict[Tuple[int, int, int], float] = {
@@ -540,10 +588,19 @@ class ExplorationRecord:
             }
             sol_gs = [g_lookup.get(k, 0.0) for k in sol_keys]
             ax_path.plot(range(len(sol_gs)), sol_gs, "g-", lw=1.5, label="optimal path")
-            ax_path.set_xlim(0, len(sol_gs) - 1)
-            ax_path.set_ylim(0, sol_gs[-1] * 1.05)
+            _path_ymax = sol_gs[-1]
+        if route_cumulative is not None:
+            ax_path.plot(range(len(route_cumulative)), route_cumulative,
+                         color="yellow", lw=1.5, ls="--", label="ref route")
+            _path_ymax = max(_path_ymax, float(route_cumulative[-1]))
+        if self.final_result is not None or route_cumulative is not None:
+            ax_path.set_ylim(0, _path_ymax * 1.05)
             ax_path.legend(fontsize=7)
-        else:
+        if self.final_result is not None:
+            ax_path.set_xlim(0, len(sol_gs) - 1)
+        elif route_cumulative is not None:
+            ax_path.set_xlim(0, len(route_cumulative) - 1)
+        if self.final_result is None and route_cumulative is None:
             ax_path.text(0.5, 0.5, "No solution found", ha="center", va="center",
                          transform=ax_path.transAxes, fontsize=9, color="red")
 
@@ -918,7 +975,7 @@ class AStarPlanner:
     def _validate_cell(self, name: str, cell: Tuple[int, int]) -> None:
         if not self._is_passable(*cell):
             raise ValueError(
-                f"{name} cell {cell} is out of bounds, a no-go cell (cost <= 0), "
+                f"{name} cell {cell} has a value: {self.cost_grid[cell]}, and is out of bounds, a no-go cell (cost <= 0), "
                 "or has infinite cost."
             )
 
