@@ -150,7 +150,7 @@ def main2():
             results[key]["labels"],
             valid_mask=valid_mask,
             sigma=20,
-            threshold=0.05,
+            threshold=0.35,
             closing_iterations=2,
             min_cluster_pixels=200,
         )

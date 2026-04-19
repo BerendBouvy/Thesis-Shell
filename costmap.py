@@ -2,6 +2,16 @@
 import aoi
 import numpy as np
 
+
+def nansum(a, axis=None):
+    """Like np.nansum, but returns NaN where all elements along the axis are NaN."""
+    a = np.asarray(a, dtype=float)
+    all_nan = np.all(np.isnan(a), axis=axis)
+    result = np.nansum(a, axis=axis)
+    result[all_nan] = np.nan
+    return result
+
+
 class CostMap:
     def __init__(self, dx, dy, default_cost=1.0, start_utm=(560123, 5931050), end_utm=(629112, 5942337), csr="EPSG:32631"):
         self.nx = 80e3
@@ -14,6 +24,7 @@ class CostMap:
         self.end_utm = end_utm
         self.csr = csr
         self.bl = 555652, 5910512
+        self.load_routes()
         self.ur = self.bl[0] + 80e3, self.bl[1] + 35e3
         self.cell_size = 5e3  # 5 km cells for slicing
         
@@ -36,6 +47,13 @@ class CostMap:
     
     def set_cost(self, x_idx, y_idx, cost, x_idx_end=None, y_idx_end=None):
         """Set the cost for a specific cell in the cost map."""
+        if x_idx is None and y_idx is None:
+            if self.costs.shape == cost.shape:
+                self.costs = cost
+            else:                
+                raise ValueError("Cost array shape does not match cost map shape")
+            return
+        
         if x_idx_end is None:
             x_idx_end = x_idx + 1
         if y_idx_end is None:
@@ -48,13 +66,19 @@ class CostMap:
         
     def add_cost(self, x_idx, y_idx, cost, x_idx_end=None, y_idx_end=None):
         """Add to the cost for a specific cell in the cost map."""
+        if x_idx is None and y_idx is None:
+            if self.costs.shape == cost.shape:
+                self.costs = nansum([self.costs, cost], axis=0)
+            else:                
+                raise ValueError("Cost array shape does not match cost map shape")
+            return
         if x_idx_end is None:
             x_idx_end = x_idx + 1
         if y_idx_end is None:
             y_idx_end = y_idx + 1
 
         if 0 <= x_idx < self.cm_width and 0 <= y_idx < self.cm_height and 0 < x_idx_end <= self.cm_width and 0 < y_idx_end <= self.cm_height:
-            self.costs[y_idx:y_idx_end, x_idx:x_idx_end] += cost
+            self.costs[y_idx:y_idx_end, x_idx:x_idx_end] = nansum([self.costs[y_idx:y_idx_end, x_idx:x_idx_end], cost], axis=0)
         else:
             raise IndexError("Cell index out of bounds")
         
@@ -77,7 +101,14 @@ class CostMap:
         else:
             raise IndexError("Cell index out of bounds")
         
-    def plot_cost_map(self, raster=None, ax=None, cmap='viridis', show=True,
+    def set_nans(self, nanmap):
+        """Set cost to NaN where nanmap is NaN."""
+        if self.costs.shape == nanmap.costs.shape:
+            self.costs[np.isnan(nanmap.costs)] = np.nan
+        else:
+            raise ValueError("Nan map shape does not match cost map shape")
+        
+    def plot_cost_map(self, raster=None, ax=None, cmap='Blues', show=True,
                       save_path=None, show_routes=False):
         """Visualize the cost map using a heatmap.
 
@@ -103,9 +134,7 @@ class CostMap:
         plt.colorbar(cax, ax=ax, label='Cost')
 
         if show_routes:
-            if not hasattr(self, "routes"):
-                self.load_routes()  # Load default routes if not already loaded
-            routes = getattr(self, "routes", [])
+            routes = self.routes
             route_colors = ["red", "cyan", "magenta", "yellow", "orange",
                             "lime", "white", "deepskyblue"]
             legend_handles = []
@@ -120,7 +149,7 @@ class CostMap:
                     Patch(color=color, label=f"Route {i + 1}  (cost: {route_cost:.1f})")
                 )
             if legend_handles:
-                ax.legend(handles=legend_handles, loc="upper right", fontsize=8)
+                ax.legend(handles=legend_handles, loc="upper left", fontsize=8)
 
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -137,11 +166,11 @@ class CostMap:
         """Return a slice of the cost map for a given index
         corresponding to one of the 112 cells in the analysis grid.
         the cells are 5x5 km, and the aoi is 80x35 km, so the grid is 16x7 cells.
-        bottom left cell is index 1, bottom right cell is index 16, top left cell is index 97, top right cell is index 112.
+        bottom left cell is index 0, bottom right cell is index 15, top left cell is index 96, top right cell is index 111.
         """
         size = self.costs.shape[0]//7
-        row = (index - 1) // 16
-        col = (index - 1) % 16
+        row = index // 16
+        col = index % 16
         x_start = int(col * size)
         x_end = x_start + int(size)
         y_start = int(row * size)
@@ -158,7 +187,7 @@ class CostMap:
         
         return x_idx, y_idx
 
-    def block_n2000(self, path="shapes/n200.shp"):
+    def block_n2000(self, array=None, path="shapes/n200.shp"):
         """
         Set all cost map cells that fall inside any N2000 polygon to -1 (no-go).
 
@@ -168,6 +197,13 @@ class CostMap:
         import geopandas as gpd
         from rasterio.transform import from_origin
         from rasterio.features import rasterize
+        
+        if array is not None:
+            if array.shape != self.costs.shape:
+                raise ValueError("Input array shape does not match cost map shape")
+            cost = array
+        else:
+            cost = self.costs
 
         gdf = gpd.read_file(path).to_crs(self.csr)
         geometries = [geom for geom in gdf.geometry if geom is not None]
@@ -184,7 +220,7 @@ class CostMap:
 
         mask = rasterize(
             [(geom, 1) for geom in geometries],
-            out_shape=self.costs.shape,
+            out_shape=cost.shape,
             transform=affine,
             fill=0,
             dtype=np.uint8,
@@ -192,7 +228,8 @@ class CostMap:
 
         # rasterize fills row 0 = north, but self.costs uses row 0 = south
         # (plotted with origin='lower'), so flip vertically before applying.
-        self.costs[np.flipud(mask) == 1] = -1
+        cost[np.flipud(mask) == 1] = -1
+        return cost
         
     def load_routes(self, file_path=["shapes/line1.shp", "shapes/line2.shp"]):
         """
@@ -261,6 +298,12 @@ class CostMap:
         _, idx = tree.query(np.column_stack([rows[nan_mask], cols[nan_mask]]))
         valid_values = self.costs[valid]
         self.costs[nan_mask] = valid_values[idx]
+        
+    def fill_nans_high_cost(self, high_cost=None):
+        """Fill NaN values in the cost map with a specified high cost."""
+        if high_cost is None:
+            high_cost = np.nanmax(self.costs)
+        self.costs[np.isnan(self.costs)] = high_cost
 
 
 

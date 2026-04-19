@@ -322,13 +322,37 @@ class PathResult:
             path_array[row, col] = 1
         return path_array
     
-    def plot_path(self, save_path: Optional[str] = None, show=False) -> None:
-        """Plot the path on the cost grid."""
+    def plot_path(
+        self,
+        route: Optional[np.ndarray] = None,
+        save_path: Optional[str] = None,
+        show=False,
+    ) -> None:
+        """Plot the path on the cost grid.
+
+        Parameters
+        ----------
+        route : np.ndarray or None
+            Optional boolean mask (same shape as cost grid) representing a
+            reference route. Drawn as a yellow overlay when provided.
+        """
+        import matplotlib.patches as mpatches
         array = self.get_numpy_path()
-        plt.imshow(self._cost_grid, cmap='gray', origin='lower')
-        plt.imshow(array, cmap='Reds', alpha=0.6, origin='lower')
-        plt.colorbar(label='Cost')
-        plt.title(f"Path (total cost: {self.total_cost:.2f})")
+        fig, ax = plt.subplots()
+        ax.imshow(self._cost_grid, cmap='gray', origin='lower')
+        legend_handles = []
+        if route is not None:
+            rows, cols = self._cost_grid.shape
+            route_overlay = np.zeros((rows, cols, 4), dtype=float)
+            route_overlay[route] = [1.0, 1.0, 0.0, 0.75]
+            ax.imshow(route_overlay, origin='lower')
+            route_cost = float(self._cost_grid[route].sum())
+            legend_handles.append(mpatches.Patch(color='yellow', alpha=0.75, label=f"Reference route (cost: {route_cost:.2f})"))
+        ax.imshow(array, cmap='Reds', alpha=0.6, origin='lower')
+        legend_handles.append(mpatches.Patch(color='red', alpha=0.6, label=f"A* path (cost: {self.total_cost:.2f})"))
+        ax.legend(handles=legend_handles, loc='upper left', fontsize=8)
+        plt.colorbar(ax.images[0], ax=ax, label='Cost')
+        ax.set_title(f"Path (total cost: {self.total_cost:.2f})")
         if save_path:
             plt.savefig(save_path, dpi=300)
         if show:
@@ -408,6 +432,8 @@ class ExplorationRecord:
         max_scatter_pts: int = 5_000,
         show_path_trace: Optional[bool] = None,
         route: Optional[np.ndarray] = None,
+        save_gif: Optional[str] = None,
+        gif_dpi: int = 80,
     ) -> mpl_animation.FuncAnimation:
         """
         Open an interactive matplotlib window to replay the A* search.
@@ -439,6 +465,13 @@ class ExplorationRecord:
               right plot (comparable to the A* solution cost line).
             - Its cumulative cost along the route (ordered greedily from start)
               is plotted in the lower-right plot.
+        save_gif : str or None
+            If given, the animation is saved to this path as a GIF before the
+            interactive window opens.  Requires the ``pillow`` package.
+            Example: ``save_gif="astar_search.gif"``
+        gif_dpi : int
+            DPI used when rendering the saved GIF.  Lower = smaller file.
+            Default 80.
         """
         rows, cols = self.cost_grid.shape
         n_exp = len(self.expansions)
@@ -463,7 +496,7 @@ class ExplorationRecord:
         # ---- figure layout ------------------------------------------------
         fig = plt.figure(figsize=(14, 6.5))
         ax_map      = fig.add_axes([0.04, 0.22, 0.52, 0.72])
-        ax_cost     = fig.add_axes([0.62, 0.54, 0.35, 0.40])
+        ax_cost     = fig.add_axes([0.62, 0.57, 0.35, 0.37])
         ax_path     = fig.add_axes([0.62, 0.22, 0.35, 0.26])
         ax_frame_sl = fig.add_axes([0.12, 0.07, 0.76, 0.025])
         ax_btn      = fig.add_axes([0.44, 0.01, 0.12, 0.05])
@@ -668,6 +701,37 @@ class ExplorationRecord:
 
         render(0)
 
+        # ---- save to GIF (optional) ---------------------------------------
+        if save_gif is not None:
+            # Hide interactive widgets so they don't appear in the saved file
+            ax_frame_sl.set_visible(False)
+            ax_btn.set_visible(False)
+            save_anim = mpl_animation.FuncAnimation(
+                fig, render, frames=range(total_frames),
+                interval=max(1, interval), repeat=False,
+            )
+            save_anim.save(save_gif, writer="pillow", dpi=gif_dpi)
+            # PillowWriter hardcodes loop=0 (infinite); re-save with loop=1 (play once)
+            from PIL import Image as _PILImage
+            _img = _PILImage.open(save_gif)
+            _frames, _durations = [], []
+            try:
+                while True:
+                    _frames.append(_img.copy())
+                    _durations.append(_img.info.get("duration", max(1, interval)))
+                    _img.seek(_img.tell() + 1)
+            except EOFError:
+                pass
+            _frames[0].save(
+                save_gif, save_all=True, append_images=_frames[1:],
+                duration=_durations, loop=1,
+            )
+            print(f"Animation saved to {save_gif!r}")
+            # Restore widgets for the interactive window
+            ax_frame_sl.set_visible(True)
+            ax_btn.set_visible(True)
+            render(0)
+
         # ---- playback state -----------------------------------------------
         state = {"frame": 0, "playing": False}
 
@@ -799,11 +863,35 @@ class AStarPlanner:
             return self._solve_numba_record(start, goal, start_heading, goal_heading)
         return self._solve_python_record(start, goal, start_heading, goal_heading)
 
-    def plot_cost_grid(self, save_path: Optional[str] = None, show=False) -> None:
-        """Plot the cost grid."""
-        plt.imshow(self.cost_grid, cmap='gray', origin='lower')
-        plt.colorbar(label='Cost')
-        plt.title("Cost Grid")
+    def plot_cost_grid(
+        self,
+        route: Optional[np.ndarray] = None,
+        save_path: Optional[str] = None,
+        show=False,
+    ) -> None:
+        """Plot the cost grid.
+
+        Parameters
+        ----------
+        route : np.ndarray or None
+            Optional boolean mask (same shape as cost grid) representing a
+            reference route. Drawn as a yellow overlay when provided.
+        """
+        import matplotlib.patches as mpatches
+        fig, ax = plt.subplots()
+        ax.imshow(self.cost_grid, cmap='gray', origin='lower')
+        legend_handles = []
+        if route is not None:
+            rows, cols = self.cost_grid.shape
+            route_overlay = np.zeros((rows, cols, 4), dtype=float)
+            route_overlay[route] = [1.0, 1.0, 0.0, 0.75]
+            ax.imshow(route_overlay, origin='lower')
+            route_cost = float(self.cost_grid[route].sum())
+            legend_handles.append(mpatches.Patch(color='yellow', alpha=0.75, label=f"Reference route (cost: {route_cost:.2f})"))
+        if legend_handles:
+            ax.legend(handles=legend_handles, loc='upper left', fontsize=8)
+        plt.colorbar(ax.images[0], ax=ax, label='Cost')
+        ax.set_title("Cost Grid")
         if save_path:
             plt.savefig(save_path, dpi=300)
         if show:
