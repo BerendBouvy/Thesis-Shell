@@ -151,7 +151,8 @@ def run():
     planner = AStarPlanner(
         cost_grid=costmap.costs,
         max_turn_steps=1,
-        heuristic_weight=1.0
+        heuristic_weight=1.0,
+        momentum=8
     )
     start_x, start_y = costmap.start_utm
     end_x, end_y = costmap.end_utm
@@ -182,6 +183,7 @@ def run_sensitivity_analysis():
     var_threshold = 0.05
     amp_threshold = 0.08
     rescale_factor = 4
+    momentum = 2
 
     # Build all data sources once
     nanmap = nan_map()
@@ -236,7 +238,8 @@ def run_sensitivity_analysis():
         planner = AStarPlanner(
             cost_grid=combined,
             max_turn_steps=1,
-            heuristic_weight=1
+            heuristic_weight=1,
+            momentum=momentum
         )
 
         result, record = planner.solve_with_recording(
@@ -250,7 +253,7 @@ def run_sensitivity_analysis():
             print(result)
             print(f"Nodes expanded: {len(record.expansions)}")
             if animate:
-                record.animate(step=2000, interval=100, route=template.routes[ref_plot], save_gif="gifs/astar_pathfinding.gif")
+                record.animate(step=100000, interval=100, route=template.routes[ref_plot], save_gif="gifs/astar_pathfinding.gif")
             else:
                 routes.append(result)
     
@@ -270,10 +273,54 @@ def run_sensitivity_analysis():
     im = ax.imshow(ref_route, cmap='tab10', origin='lower')
 
     ax.set_title(f"Route Frequency Heatmap over {n} Runs (sigma={sigma})")
-    ax.set_xlabel('X Index')    
+    ax.set_xlabel('X Index')
     ax.set_ylabel('Y Index')
     plt.savefig(f"temp/route_frequency_heatmap_sigma_{sigma}_{time.time()}.png", dpi=300)
     # plt.show()
+
+    # --- Consensus route: A* on inverse-frequency cost map ---
+    # Cells visited by many routes get low cost; unvisited cells get high cost.
+    # consensus_cost in range [1, n+1]: visited n times → 1, visited 0 times → n+1.
+    heatmap_filled = np.where(np.isnan(heatmap), 0, heatmap)
+    consensus_cost = (n + 1) / (heatmap_filled + 1)
+
+    # Re-apply the nan mask (rescaled to match the heatmap resolution)
+    if rescale_factor > 1:
+        rescaled_nan_mask = ski.measure.block_reduce(
+            nan_mask.astype(float), block_size=rescale_factor, func=np.max
+        ).astype(bool)
+    else:
+        rescaled_nan_mask = nan_mask
+    consensus_cost[rescaled_nan_mask] = np.nanmax(consensus_cost)
+
+    consensus_planner = AStarPlanner(
+        cost_grid=consensus_cost,
+        max_turn_steps=1,
+        heuristic_weight=1.0,
+        momentum=momentum
+    )
+    consensus_result = consensus_planner.solve(
+        start=(start_y_idx, start_x_idx),
+        goal=(end_y_idx, end_x_idx),
+        start_heading=0,
+        goal_heading=6,
+    )
+
+    if consensus_result is not None:
+        consensus_overlay = np.where(consensus_result.get_numpy_path(), 1.0, np.nan)
+        fig2, ax2 = plt.subplots(figsize=(10, 5))
+        ax2.imshow(combined, cmap=cmocean.cm.deep, alpha=0.5, origin='lower')
+        im2 = ax2.imshow(heatmap, cmap='hot', origin='lower', alpha=0.75)
+        plt.colorbar(im2, ax=ax2, label='Route Frequency')
+        ax2.imshow(ref_route, cmap='tab10', origin='lower')
+        ax2.imshow(consensus_overlay, cmap='cool', origin='lower', alpha=0.9)
+        ax2.set_title(f"Consensus Route over {n} Runs (sigma={sigma})")
+        ax2.set_xlabel('X Index')
+        ax2.set_ylabel('Y Index')
+        plt.savefig(f"temp/consensus_route_sigma_{sigma}_{time.time()}.png", dpi=300)
+        # plt.show()
+    else:
+        print("Consensus route: no path found.")
     
 def plot_nan_map_with_cells():
     """Plot the nan_map with UTM coords, data-count overlay, routes, and cell index labels."""
@@ -358,7 +405,7 @@ def combine_rasters(rasters, func=np.nanmean):
 if __name__ == "__main__":
     start = time.time()
     # run()
-    # run_sensitivity_analysis()
-    plot_nan_map_with_cells()
+    run_sensitivity_analysis()
+    # plot_nan_map_with_cells()
     end = time.time()
     print(f"Execution time: {(end - start) / 60:.2f} minutes")

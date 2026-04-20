@@ -128,16 +128,34 @@ if _NUMBA_AVAILABLE:
         max_turn_steps, min_cost, hw,
         move_dr, move_dc, move_dist,
         hf, hg, hs, hn,
+        momentum,
     ):
         """
         Core A* in nopython mode.
-        State encoding:  sid = row * cols * 8 + col * 8 + heading
+        State encoding:
+          sid = row * cols * NUM_H * momentum * NUM_H
+              + col * NUM_H * momentum * NUM_H
+              + heading * momentum * NUM_H
+              + s * NUM_H
+              + prev_heading
+
+          s in {0, ..., momentum-1}: mandatory straight steps still required.
+          prev_heading: the heading before the last turn (used for zigzag).
+
+          Turn rule: a turn from heading h to next_h is allowed when
+            (a) s == 0  (free to turn), OR
+            (b) next_h == prev_heading  (compensating zigzag: exactly reverses
+                the last turn, e.g. NE→E→NE for a non-grid-aligned straight).
+          This lets the path staircase at arbitrary angles without being
+          blocked by the momentum constraint.
+
+          momentum=1 → s is always 0, behaviour identical to classic A*.
         goal_h = -1 → accept any arrival heading.
         Returns: came_from (int64 flat array), g_score (float64 flat array), goal_sid.
         First call triggers JIT compilation (~10-30 s); subsequent calls are fast.
         """
         NUM_H = np.int64(8)
-        N = rows * cols * NUM_H
+        N = rows * cols * NUM_H * momentum * NUM_H
 
         g_score   = np.full(N, np.inf,       dtype=np.float64)
         came_from = np.full(N, np.int64(-1), dtype=np.int64)
@@ -146,7 +164,14 @@ if _NUMBA_AVAILABLE:
         dc0 = np.float64(goal_c - start_c)
         f0  = hw * math.sqrt(dr0 * dr0 + dc0 * dc0) * min_cost
         for h in init_headings:
-            sid = np.int64(start_r * cols * NUM_H + start_c * NUM_H + h)
+            # s=0, prev_heading=h (don't-care when s=0, use heading as sentinel)
+            sid = np.int64(
+                start_r * cols * NUM_H * momentum * NUM_H
+                + start_c * NUM_H * momentum * NUM_H
+                + h * momentum * NUM_H
+                + np.int64(0) * NUM_H
+                + h
+            )
             g_score[sid] = 0.0
             _nb_push(hf, hg, hs, hn, f0, 0.0, sid)
 
@@ -158,9 +183,11 @@ if _NUMBA_AVAILABLE:
             if g > g_score[sid]:
                 continue
 
-            row     = sid // (cols * NUM_H)
-            col     = (sid // NUM_H) % cols
-            heading = sid % NUM_H
+            prev_h  = sid % NUM_H
+            s       = (sid // NUM_H) % momentum
+            heading = (sid // (NUM_H * momentum)) % NUM_H
+            col     = (sid // (NUM_H * momentum * NUM_H)) % cols
+            row     = sid // (NUM_H * momentum * NUM_H * cols)
 
             if row == goal_r and col == goal_c:
                 if goal_h < 0 or heading == goal_h:
@@ -173,6 +200,9 @@ if _NUMBA_AVAILABLE:
                     diff = NUM_H - diff
                 if diff > max_turn_steps:
                     continue
+                # Momentum + zigzag rule: block turns unless s==0 or compensating
+                if diff > np.int64(0) and s > np.int64(0) and next_h != prev_h:
+                    continue
                 nr = row + move_dr[next_h]
                 nc = col + move_dc[next_h]
                 if nr < 0 or nr >= rows or nc < 0 or nc >= cols:
@@ -180,8 +210,22 @@ if _NUMBA_AVAILABLE:
                 cell_cost = cost_grid[nr, nc]
                 if cell_cost <= 0.0 or not np.isfinite(cell_cost):
                     continue
+                if next_h == heading:  # straight: decrement s, keep prev_h
+                    new_s = s - np.int64(1)
+                    if new_s < np.int64(0):
+                        new_s = np.int64(0)
+                    new_ph = prev_h
+                else:  # turn (fresh or compensating): reset s, record current heading
+                    new_s = momentum - np.int64(1)
+                    new_ph = heading
                 tentative_g = g + move_dist[next_h] * cell_cost
-                nsid = np.int64(nr * cols * NUM_H + nc * NUM_H + next_h)
+                nsid = np.int64(
+                    nr * cols * NUM_H * momentum * NUM_H
+                    + nc * NUM_H * momentum * NUM_H
+                    + next_h * momentum * NUM_H
+                    + new_s * NUM_H
+                    + new_ph
+                )
                 if tentative_g < g_score[nsid]:
                     g_score[nsid]   = tentative_g
                     came_from[nsid] = sid
@@ -202,10 +246,11 @@ if _NUMBA_AVAILABLE:
         move_dr, move_dc, move_dist,
         hf, hg, hs, hn,
         exp_sids, exp_gs,
+        momentum,
     ):
         """Like _nb_astar but appends each expanded (sid, g) to exp_sids / exp_gs."""
         NUM_H = np.int64(8)
-        N = rows * cols * NUM_H
+        N = rows * cols * NUM_H * momentum * NUM_H
 
         g_score   = np.full(N, np.inf,       dtype=np.float64)
         came_from = np.full(N, np.int64(-1), dtype=np.int64)
@@ -214,7 +259,13 @@ if _NUMBA_AVAILABLE:
         dc0 = np.float64(goal_c - start_c)
         f0  = hw * math.sqrt(dr0 * dr0 + dc0 * dc0) * min_cost
         for h in init_headings:
-            sid = np.int64(start_r * cols * NUM_H + start_c * NUM_H + h)
+            sid = np.int64(
+                start_r * cols * NUM_H * momentum * NUM_H
+                + start_c * NUM_H * momentum * NUM_H
+                + h * momentum * NUM_H
+                + np.int64(0) * NUM_H
+                + h
+            )
             g_score[sid] = 0.0
             _nb_push(hf, hg, hs, hn, f0, 0.0, sid)
 
@@ -226,9 +277,11 @@ if _NUMBA_AVAILABLE:
             if g > g_score[sid]:
                 continue
 
-            row     = sid // (cols * NUM_H)
-            col     = (sid // NUM_H) % cols
-            heading = sid % NUM_H
+            prev_h  = sid % NUM_H
+            s       = (sid // NUM_H) % momentum
+            heading = (sid // (NUM_H * momentum)) % NUM_H
+            col     = (sid // (NUM_H * momentum * NUM_H)) % cols
+            row     = sid // (NUM_H * momentum * NUM_H * cols)
 
             exp_sids.append(sid)
             exp_gs.append(g)
@@ -244,6 +297,8 @@ if _NUMBA_AVAILABLE:
                     diff = NUM_H - diff
                 if diff > max_turn_steps:
                     continue
+                if diff > np.int64(0) and s > np.int64(0) and next_h != prev_h:
+                    continue
                 nr = row + move_dr[next_h]
                 nc = col + move_dc[next_h]
                 if nr < 0 or nr >= rows or nc < 0 or nc >= cols:
@@ -251,8 +306,22 @@ if _NUMBA_AVAILABLE:
                 cell_cost = cost_grid[nr, nc]
                 if cell_cost <= 0.0 or not np.isfinite(cell_cost):
                     continue
+                if next_h == heading:
+                    new_s = s - np.int64(1)
+                    if new_s < np.int64(0):
+                        new_s = np.int64(0)
+                    new_ph = prev_h
+                else:
+                    new_s = momentum - np.int64(1)
+                    new_ph = heading
                 tentative_g = g + move_dist[next_h] * cell_cost
-                nsid = np.int64(nr * cols * NUM_H + nc * NUM_H + next_h)
+                nsid = np.int64(
+                    nr * cols * NUM_H * momentum * NUM_H
+                    + nc * NUM_H * momentum * NUM_H
+                    + next_h * momentum * NUM_H
+                    + new_s * NUM_H
+                    + new_ph
+                )
                 if tentative_g < g_score[nsid]:
                     g_score[nsid]   = tentative_g
                     came_from[nsid] = sid
@@ -786,6 +855,13 @@ class AStarPlanner:
     heuristic_weight : float
         Weight applied to the heuristic (w=1 → standard A*, w>1 → faster but
         suboptimal weighted A*).  Default 1.0.
+    momentum : int
+        Minimum number of steps that must be taken in the same heading before
+        a turn is allowed.  momentum=1 (default) imposes no extra constraint.
+        momentum=2 → after any turn, one straight step is required before the
+        next turn.  momentum=3 → two straight steps required, etc.
+        Larger values produce smoother, less sinuous paths at the cost of a
+        state space that is momentum× larger.
     """
 
     def __init__(
@@ -793,6 +869,7 @@ class AStarPlanner:
         cost_grid: np.ndarray,
         max_turn_steps: int = 2,
         heuristic_weight: float = 1.0,
+        momentum: int = 1,
     ) -> None:
         if cost_grid.ndim != 2:
             raise ValueError("cost_grid must be a 2-D array.")
@@ -800,6 +877,7 @@ class AStarPlanner:
         self.rows, self.cols = cost_grid.shape
         self.max_turn_steps = max_turn_steps
         self.heuristic_weight = heuristic_weight
+        self.momentum = max(1, int(momentum))
 
         # Minimum finite cell cost — used to keep the heuristic admissible
         finite_mask = np.isfinite(self.cost_grid) & (self.cost_grid > 0)
@@ -908,7 +986,7 @@ class AStarPlanner:
         heap = []
         init_headings = range(NUM_HEADINGS) if start_heading is None else [start_heading]
         for h in init_headings:
-            key = (start[0], start[1], h)
+            key = (start[0], start[1], h, 0, h)  # s=0, prev_heading=h (sentinel)
             g_score[key] = 0.0
             came_from[key] = None
             _hq.heappush(heap, (self._heuristic(start[0], start[1], goal), 0.0, key))
@@ -917,11 +995,11 @@ class AStarPlanner:
             _, g, current = _hq.heappop(heap)
             if g > g_score.get(current, math.inf):
                 continue
-            row, col, heading = current
+            row, col, heading, s, prev_heading = current
             if (row, col) == goal and (goal_heading is None or heading == goal_heading):
                 goal_key = current
                 break
-            for next_key, move_cost in self._neighbors(row, col, heading):
+            for next_key, move_cost in self._neighbors(row, col, heading, s, prev_heading):
                 tg = g + move_cost
                 if tg < g_score.get(next_key, math.inf):
                     g_score[next_key] = tg
@@ -935,34 +1013,39 @@ class AStarPlanner:
         import heapq as _hq
         g_score = {}
         came_from = {}
+        came_from_3 = {}  # 3-tuple version (row, col, heading) used by ExplorationRecord animation
         heap = []
         expansions = []
         init_headings = range(NUM_HEADINGS) if start_heading is None else [start_heading]
         for h in init_headings:
-            key = (start[0], start[1], h)
+            key = (start[0], start[1], h, 0, h)  # s=0, prev_heading=h (sentinel)
             g_score[key] = 0.0
             came_from[key] = None
+            came_from_3[(start[0], start[1], h)] = None
             _hq.heappush(heap, (self._heuristic(start[0], start[1], goal), 0.0, key))
         goal_key = None
         while heap:
             _, g, current = _hq.heappop(heap)
             if g > g_score.get(current, math.inf):
                 continue
-            row, col, heading = current
+            row, col, heading, s, prev_heading = current
             expansions.append((row, col, heading, g))
             if (row, col) == goal and (goal_heading is None or heading == goal_heading):
                 goal_key = current
                 break
-            for next_key, move_cost in self._neighbors(row, col, heading):
+            for next_key, move_cost in self._neighbors(row, col, heading, s, prev_heading):
                 tg = g + move_cost
                 if tg < g_score.get(next_key, math.inf):
                     g_score[next_key] = tg
                     came_from[next_key] = current
+                    nk3 = (next_key[0], next_key[1], next_key[2])
+                    if nk3 not in came_from_3:
+                        came_from_3[nk3] = (current[0], current[1], current[2])
                     _hq.heappush(heap, (tg + self._heuristic(next_key[0], next_key[1], goal), tg, next_key))
         result = None
         if goal_key is not None:
             result = PathResult(self._reconstruct(came_from, goal_key), g_score[goal_key], self.cost_grid)
-        return result, ExplorationRecord(expansions, came_from, self.cost_grid, start, goal, result)
+        return result, ExplorationRecord(expansions, came_from_3, self.cost_grid, start, goal, result)
 
     # ------------------------------------------------------------------
     # Numba implementations
@@ -977,10 +1060,11 @@ class AStarPlanner:
         return hf, hg, hs, hn
 
     def _nb_decode_sid(self, sid: int) -> Tuple[int, int, int]:
-        """Decode a flat state id back to (row, col, heading)."""
-        heading = int(sid % NUM_HEADINGS)
-        col     = int((sid // NUM_HEADINGS) % self.cols)
-        row     = int(sid // (self.cols * NUM_HEADINGS))
+        """Decode a flat state id back to (row, col, heading). s and prev_heading are dropped."""
+        # encoding: ... + heading * momentum * NUM_H + s * NUM_H + prev_heading
+        heading = int((sid // (NUM_HEADINGS * self.momentum)) % NUM_HEADINGS)
+        col     = int((sid // (NUM_HEADINGS * self.momentum * NUM_HEADINGS)) % self.cols)
+        row     = int(sid // (NUM_HEADINGS * self.momentum * NUM_HEADINGS * self.cols))
         return row, col, heading
 
     def _nb_reconstruct(self, came_from_arr: np.ndarray, goal_sid: int) -> List[State]:
@@ -1006,6 +1090,7 @@ class AStarPlanner:
             np.float64(self._min_cost), np.float64(self.heuristic_weight),
             _NB_MOVE_DR, _NB_MOVE_DC, _NB_MOVE_DIST_ARR,
             hf, hg, hs, hn,
+            np.int64(self.momentum),
         )
         if goal_sid < 0:
             return None
@@ -1029,18 +1114,24 @@ class AStarPlanner:
             _NB_MOVE_DR, _NB_MOVE_DC, _NB_MOVE_DIST_ARR,
             hf, hg, hs, hn,
             exp_sids, exp_gs,
+            np.int64(self.momentum),
         )
         # Decode expansions: (row, col, heading, g)
         expansions = []
         for sid, g in zip(exp_sids, exp_gs):
             expansions.append((*self._nb_decode_sid(int(sid)), float(g)))
 
-        # Build came_from dict only for visited states (came_from_arr != -1 or start)
+        # Build came_from dict for animation (3-tuple keys).
+        # First-visit wins: A* expands in cost order, so the first time a
+        # (row, col, heading) is seen is via the cheapest path. Overwriting
+        # later would risk creating cycles when multiple full states
+        # (r, c, h, s, prev_h) collapse to the same 3-tuple key.
         came_from_dict = {}
         for sid, g in zip(exp_sids, exp_gs):
             key = self._nb_decode_sid(int(sid))
-            parent_sid = int(came_from_arr[int(sid)])
-            came_from_dict[key] = self._nb_decode_sid(parent_sid) if parent_sid >= 0 else None
+            if key not in came_from_dict:
+                parent_sid = int(came_from_arr[int(sid)])
+                came_from_dict[key] = self._nb_decode_sid(parent_sid) if parent_sid >= 0 else None
 
         result = None
         if goal_sid >= 0:
@@ -1080,12 +1171,16 @@ class AStarPlanner:
         return min(diff, NUM_HEADINGS - diff)
 
     def _neighbors(
-        self, row: int, col: int, heading: int
-    ) -> List[Tuple[Tuple[int, int, int], float]]:
+        self, row: int, col: int, heading: int, s: int = 0, prev_heading: int = 0
+    ) -> List[Tuple[Tuple[int, int, int, int, int], float]]:
         """Return (next_state_key, move_cost) for all valid transitions."""
         results = []
         for next_h in range(NUM_HEADINGS):
-            if self._heading_diff(heading, next_h) > self.max_turn_steps:
+            diff = self._heading_diff(heading, next_h)
+            if diff > self.max_turn_steps:
+                continue
+            # Momentum + zigzag: block turns unless s==0 or compensating (next_h == prev_heading)
+            if diff > 0 and s > 0 and next_h != prev_heading:
                 continue
             dr, dc = MOVE_DELTAS[next_h]
             nr, nc = row + dr, col + dc
@@ -1093,18 +1188,24 @@ class AStarPlanner:
                 continue
             cell_cost = self.cost_grid[nr, nc]
             move_cost = MOVE_DIST[next_h] * cell_cost
-            results.append(((nr, nc, next_h), move_cost))
+            if next_h == heading:  # straight
+                new_s = max(0, s - 1)
+                new_ph = prev_heading
+            else:  # turn (fresh or compensating)
+                new_s = self.momentum - 1
+                new_ph = heading
+            results.append(((nr, nc, next_h, new_s, new_ph), move_cost))
         return results
 
     def _reconstruct(
         self,
         came_from: Dict[Tuple, Optional[Tuple]],
-        goal_key: Tuple[int, int, int],
+        goal_key: Tuple[int, int, int, int, int],
     ) -> List[State]:
         path: List[State] = []
-        key: Optional[Tuple[int, int, int]] = goal_key
+        key: Optional[Tuple] = goal_key
         while key is not None:
-            path.append(State(*key))
+            path.append(State(key[0], key[1], key[2]))  # drop s and prev_heading
             key = came_from[key]
         path.reverse()
         return path
@@ -1137,7 +1238,8 @@ if __name__ == "__main__":
     planner = AStarPlanner(
         cost_grid=grid,
         max_turn_steps=1,      # max 45° per step
-        heuristic_weight=2  # admissible → optimal path
+        heuristic_weight=2,
+        momentum=1,            # 1 = no extra constraint; 2+ = require N-1 straight steps after each turn
     )
     
     # planner.plot_cost_grid(show=True)
