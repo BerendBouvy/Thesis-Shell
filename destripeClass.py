@@ -288,7 +288,7 @@ class Destriper:
                 plt.savefig(os.path.join(target_dir, "angle_detection.png"), dpi=300, bbox_inches='tight')
             plt.close(fig)
             
-            fig, axes = plt.subplots(1, 3, figsize=(20, 5), constrained_layout=True)
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5), constrained_layout=True)
             axes[0].set_title("Angle vs Response", pad=10)
             axes[0].plot(angles, responses, marker='o', markersize=3, linewidth=1.2)
             axes[0].scatter([angle], [responses[best_idx]], color='red', s=50, zorder=3)
@@ -296,23 +296,12 @@ class Destriper:
             axes[0].set_ylabel("Notch Response")
             axes[0].grid(alpha=0.3)
 
-            axes[1].set_title("First Difference of Response", pad=10)
-            diff = np.diff(responses)
-            axes[1].plot(angles[:-1], diff, marker='o', markersize=3, linewidth=1.2)
-            if best_idx < len(diff):
-                axes[1].scatter([angle], [diff[best_idx]], color='red', s=50, zorder=3)
-            elif best_idx > 0:
-                axes[1].scatter([angles[best_idx - 1]], [diff[best_idx - 1]], color='red', s=50, zorder=3)
+            axes[1].set_title("Relative Height vs Neighbors", pad=10)
+            axes[1].plot(angles, relative_height, marker='o', markersize=3, linewidth=1.2)
+            axes[1].scatter([angle], [relative_height[best_idx]], color='red', s=50, zorder=3)
             axes[1].set_xlabel("Angle (degrees)")
-            axes[1].set_ylabel("First Difference")
+            axes[1].set_ylabel("Relative Height")
             axes[1].grid(alpha=0.3)
-
-            axes[2].set_title("Relative Height vs Neighbors", pad=10)
-            axes[2].plot(angles, relative_height, marker='o', markersize=3, linewidth=1.2)
-            axes[2].scatter([angle], [relative_height[best_idx]], color='red', s=50, zorder=3)
-            axes[2].set_xlabel("Angle (degrees)")
-            axes[2].set_ylabel("Relative Height")
-            axes[2].grid(alpha=0.3)
             
             if target_dir:
                 plt.savefig(os.path.join(target_dir, "angle_response_diff.png"), dpi=300, bbox_inches='tight')

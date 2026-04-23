@@ -389,6 +389,460 @@ def plot_nan_map_with_cells():
     plt.show()
 
 
+def plot_turn_rules(momentum=4, staircase_width=3, n_cycles=3):
+    """
+    Two-panel publish figure for the heading-aware A* kinematic constraints.
+
+    Left  — Rose diagram of legal / illegal next headings from a freshly-turned
+             state (heading=NE, s=momentum-1, prev_heading=E).
+    Right — Staircase path on a grid showing that prev_heading is NOT
+             overwritten on straight steps, so every NE re-entry is a
+             compensating turn and therefore always legal regardless of s.
+    """
+    import matplotlib.patches as mpatches
+    from matplotlib.lines import Line2D
+
+    # ---- typography ---------------------------------------------------------
+    FS       = 14    # panel titles, axis labels, boxed text
+    FS_SMALL = 12    # legend, secondary labels
+    FS_ANN   = 11    # cell annotations in right panel
+
+    # ---- shared geometry ----------------------------------------------------
+    m         = momentum
+    DIRS_XY   = [(1,0),(1,1),(0,1),(-1,1),(-1,0),(-1,-1),(0,-1),(1,-1)]
+    DIR_NAMES = ['E','NE','N','NW','W','SW','S','SE']
+
+    # ---- colours (consistent between panels) --------------------------------
+    C_LEGAL   = '#2ca02c'   # green
+    C_ILLEGAL = '#d62728'   # red
+    C_GREY    = '#aaaaaa'   # unreachable
+    C_BLUE    = 'steelblue'
+    C_ORANGE  = 'darkorange'
+    C_GREEN   = 'mediumseagreen'
+    C_LBLUE   = '#a8d4f5'   # light blue (straight_ph)
+
+    TYPE_COLOR = {
+        'straight_init': C_BLUE,
+        'first_turn':    C_ORANGE,
+        'compensating':  C_GREEN,
+        'straight_ph':   C_LBLUE,
+    }
+
+    # ---- figure layout ------------------------------------------------------
+    fig = plt.figure(figsize=(24, 13))
+    gs  = fig.add_gridspec(1, 2, width_ratios=[0.65, 2.0], wspace=0.22)
+    ax_l = fig.add_subplot(gs[0])
+    ax_r = fig.add_subplot(gs[1])
+    fig.subplots_adjust(bottom=0.22, top=0.91)
+
+    # ======================================================================== #
+    # LEFT PANEL — turn-rule rose diagram                                       #
+    # ======================================================================== #
+    cur_heading = 1      # NE
+    cur_s       = m - 1
+    cur_ph      = 0      # E
+    cx, cy      = 0.0, 0.0
+    ARROW_LEN   = 1.9
+    TEXT_OFF    = 0.40   # extra offset beyond arrow tip
+
+    for h_idx, (adx, ady) in enumerate(DIRS_XY):
+        diff = min(abs(cur_heading - h_idx) % 8,
+                   (8 - abs(cur_heading - h_idx)) % 8)
+
+        is_straight     = (h_idx == cur_heading)
+        is_compensating = (h_idx == cur_ph)
+        within_reach    = (diff <= 1)
+
+        if not within_reach:
+            color, lw, reason = C_GREY, 1.4, 'unreachable\n(> 45°)'
+        elif is_straight or is_compensating:
+            color, lw = C_LEGAL, 3.2
+            reason = 'straight' if is_straight else 'compensating\n(next_h = prev_h)'
+        else:
+            color, lw = C_ILLEGAL, 3.2
+            reason = 'blocked\n(s > 0,  not compensating)'
+
+        ex, ey = cx + adx * ARROW_LEN, cy + ady * ARROW_LEN
+        ax_l.annotate(
+            '', xy=(ex, ey), xytext=(cx, cy),
+            arrowprops=dict(arrowstyle='->', color=color, lw=lw, mutation_scale=22),
+        )
+        # label: white background box for readability
+        ax_l.text(
+            ex + adx * TEXT_OFF, ey + ady * TEXT_OFF,
+            f'{DIR_NAMES[h_idx]}\n{reason}',
+            ha='center', va='center', fontsize=FS_SMALL,
+            color=color, fontweight='bold' if within_reach else 'normal',
+            bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
+                      edgecolor='none', alpha=0.75),
+        )
+
+    # Current-state dot
+    ax_l.plot(cx, cy, 'ko', ms=14, zorder=6)
+
+    # Incoming arrow (arrived from SW, heading NE)
+    ax_l.annotate(
+        '', xy=(cx, cy), xytext=(cx - 1.05, cy - 1.05),
+        arrowprops=dict(arrowstyle='->', color=C_BLUE, lw=2.6, mutation_scale=20),
+    )
+    ax_l.text(
+        cx - 1.55, cy - 0.80,
+        'arrived via NE\n(first turn from E)',
+        ha='center', va='top', fontsize=FS_SMALL - 1, color=C_BLUE,
+        bbox=dict(boxstyle='round,pad=0.25', facecolor='white',
+                  edgecolor=C_BLUE, linewidth=0.8, alpha=0.90),
+    )
+
+    # State box — top
+    ax_l.text(
+        cx, 3.05,
+        f'State:  heading = NE,  s = {cur_s},  prev_heading = E',
+        ha='center', va='center', fontsize=FS,
+        bbox=dict(boxstyle='round,pad=0.5', facecolor='#fffbe6',
+                  edgecolor='#c8a800', linewidth=1.2, alpha=0.97),
+    )
+
+    # Rule box — bottom
+    ax_l.text(
+        cx, -3.05,
+        'Turn rule:  legal if  s = 0  OR  next_h = prev_heading',
+        ha='center', va='center', fontsize=FS,
+        bbox=dict(boxstyle='round,pad=0.5', facecolor='#e8f4fd',
+                  edgecolor='steelblue', linewidth=1.2, alpha=0.97),
+    )
+
+    ax_l.set_xlim(-3.4, 3.4)
+    ax_l.set_ylim(-3.7, 3.7)
+    ax_l.set_aspect('equal')
+    ax_l.axis('off')
+    ax_l.set_title(
+        f'Turn legality diagram  (momentum = {m})\n'
+        f'State after first turn:  heading = NE,  s = {cur_s},  prev_heading = E',
+        fontsize=FS + 1, pad=14, fontweight='bold',
+    )
+
+    legend_l = [
+        Line2D([0],[0], color=C_LEGAL,   lw=2.5, label='Legal  (straight or compensating)'),
+        Line2D([0],[0], color=C_ILLEGAL, lw=2.5, label='Illegal  (s > 0,  not compensating)'),
+        Line2D([0],[0], color=C_GREY,    lw=1.5, label='Unreachable  (> 45° from current heading)'),
+    ]
+    ax_l.legend(
+        handles=legend_l, fontsize=FS_SMALL,
+        loc='upper center', bbox_to_anchor=(0.5, -0.01),
+        frameon=True, ncol=1, edgecolor='#cccccc',
+    )
+
+    # ======================================================================== #
+    # RIGHT PANEL — staircase path                                              #
+    # ======================================================================== #
+    positions, states = [], []
+    x, y    = 0, 0
+    heading = 0   # E
+    s       = 0
+    ph      = 0   # E
+
+    # Initial straight East steps (free to turn, s=0)
+    for _ in range(m):
+        positions.append((x, y))
+        states.append({'h': heading, 's': s, 'ph': ph, 'type': 'straight_init'})
+        x += 1
+        s = max(0, s - 1)
+
+    # First turn E -> NE
+    x += 1;  y += 1
+    positions.append((x, y))
+    states.append({'h': 1, 's': m - 1, 'ph': 0, 'type': 'first_turn'})
+    heading, s, ph = 1, m - 1, 0
+
+    # Staircase cycles
+    for _ in range(n_cycles):
+        for _ in range(staircase_width):
+            next_h = 0   # E
+            bdx, bdy = DIRS_XY[next_h]
+            x += bdx;  y += bdy
+            if next_h == heading:          # straight
+                new_s, new_ph = max(0, s - 1), ph    # ph UNCHANGED
+                stype = 'straight_ph'
+            else:                          # compensating (E after NE)
+                new_s, new_ph = m - 1, heading
+                stype = 'compensating'
+            positions.append((x, y))
+            states.append({'h': next_h, 's': new_s, 'ph': new_ph, 'type': stype})
+            heading, s, ph = next_h, new_s, new_ph
+
+        next_h = 1   # NE (compensating)
+        bdx, bdy = DIRS_XY[next_h]
+        x += bdx;  y += bdy
+        new_s, new_ph = m - 1, heading
+        positions.append((x, y))
+        states.append({'h': next_h, 's': new_s, 'ph': new_ph, 'type': 'compensating'})
+        heading, s, ph = next_h, new_s, new_ph
+
+    # Trim final 5 cells to reduce crowding
+    positions = positions[:-5]
+    states    = states[:-5]
+
+    xs_all = [p[0] for p in positions]
+    ys_all = [p[1] for p in positions]
+    x_lo = int(min(xs_all))
+    x_hi = int(max(xs_all))
+    y_lo = int(min(ys_all))
+    y_hi = int(max(ys_all))
+
+    ax_r.set_xlim(x_lo - 0.7, x_hi + 0.7)
+    ax_r.set_ylim(y_lo - 0.7, y_hi + 2.8)    # generous top for bracket labels
+    ax_r.set_xticks(np.arange(x_lo, x_hi + 1), minor=True)
+    ax_r.set_yticks(np.arange(y_lo, y_hi + 1), minor=True)
+    ax_r.grid(which='minor', color='#dddddd', linewidth=0.6)
+    ax_r.tick_params(which='minor', length=0)
+    ax_r.tick_params(axis='both', which='major', labelsize=FS_SMALL)
+
+    # Shade cells
+    for (px, py), st in zip(positions, states):
+        alpha = 0.65 if st['type'] == 'first_turn' else 0.50
+        ax_r.add_patch(plt.Rectangle(
+            (px - 0.5, py - 0.5), 1, 1,
+            facecolor=TYPE_COLOR[st['type']], alpha=alpha,
+            edgecolor='#888888', linewidth=0.7, zorder=2,
+        ))
+
+    # Direction arrows between consecutive cells
+    for i in range(len(positions) - 1):
+        x0, y0 = positions[i]
+        x1, y1 = positions[i + 1]
+        col = TYPE_COLOR[states[i + 1]['type']]
+        ax_r.annotate(
+            '', xy=(x1, y1), xytext=(x0, y0),
+            arrowprops=dict(arrowstyle='->', color=col, lw=2.2, mutation_scale=16),
+            zorder=3,
+        )
+
+    # State labels inside cells — two-line compact format
+    for (px, py), st in zip(positions, states):
+        ax_r.text(
+            px, py,
+            f"h={DIR_NAMES[st['h']]}\ns={st['s']}\nph={DIR_NAMES[st['ph']]}",
+            ha='center', va='center', fontsize=FS_ANN,
+            linespacing=1.35, zorder=4,
+        )
+
+    # "ph unchanged" brackets above each run of straight_ph cells
+    i = 0
+    while i < len(states):
+        if states[i]['type'] == 'straight_ph':
+            j = i
+            while j < len(states) and states[j]['type'] == 'straight_ph':
+                j += 1
+            bx0 = positions[i][0]     - 0.38
+            bx1 = positions[j - 1][0] + 0.38
+            by  = positions[i][1]     + 0.62    # just above cell top (0.5)
+            mid = (bx0 + bx1) / 2
+            # horizontal span line
+            ax_r.annotate(
+                '', xy=(bx1, by), xytext=(bx0, by),
+                arrowprops=dict(arrowstyle='<->', color='#444444', lw=1.6),
+                zorder=5,
+            )
+            # label above the line
+            ax_r.text(
+                mid, by + 0.22,
+                'ph unchanged  (straight steps)',
+                ha='center', va='bottom', fontsize=FS_ANN,
+                color='#333333', style='italic',
+                bbox=dict(boxstyle='round,pad=0.15', facecolor='white',
+                          edgecolor='none', alpha=0.80),
+                zorder=6,
+            )
+            i = j
+        else:
+            i += 1
+
+    ax_r.set_aspect('equal')
+    ax_r.set_xlabel('East  (cells)', fontsize=FS, labelpad=6)
+    ax_r.set_ylabel('North  (cells)', fontsize=FS, labelpad=6)
+    ax_r.set_title(
+        f'Staircase path  (momentum = {m},  {staircase_width} East steps per cycle)\n'
+        f'h = heading,   s = straight steps remaining,   ph = prev_heading',
+        fontsize=FS + 1, pad=14, fontweight='bold',
+    )
+
+    legend_r = [
+        mpatches.Patch(facecolor=C_BLUE,   alpha=0.55, label=f'Initial straight East  (s = 0, free to turn)'),
+        mpatches.Patch(facecolor=C_ORANGE, alpha=0.75, label=f'First turn E -> NE  (s resets to {m - 1})'),
+        mpatches.Patch(facecolor=C_GREEN,  alpha=0.60, label='Compensating turn  (next_h = ph, always legal)'),
+        mpatches.Patch(facecolor=C_LBLUE,  alpha=0.60, label='Straight East step  (ph preserved, NE stays compensating)'),
+    ]
+    ax_r.legend(
+        handles=legend_r, fontsize=FS_SMALL,
+        loc='upper center', bbox_to_anchor=(0.5, -0.20),
+        frameon=True, ncol=2, edgecolor='#cccccc',
+    )
+
+    plt.suptitle(
+        'A* kinematic constraints: legal vs illegal turns',
+        fontsize=FS + 4, fontweight='bold', y=0.97,
+    )
+    os.makedirs('temp', exist_ok=True)
+    plt.savefig(f'temp/turn_rules_momentum_{m}.png', dpi=200, bbox_inches='tight')
+    plt.show()
+
+
+def plot_bend_radius(momentum_values=None, cell_size=100):
+    """
+    Construct the smallest possible octagonal turn path for each momentum value,
+    compute its area via the shoelace formula, derive the radius of the
+    area-equivalent circle, and plot both the octagon and circle on a cell grid.
+
+    With max_turn_steps=1 (45°/step) and momentum=m, the tightest turn is an
+    octagon where each of the 8 sides consists of m steps in one direction.
+    The octagon area (in cell units) is exactly 7*m^2, giving radius:
+        R = sqrt(7/pi) * m * cell_size  ≈  1.493 * m * cell_size
+
+    Parameters
+    ----------
+    momentum_values : list of int
+    cell_size : float  Cell size in metres (default 100).
+    """
+    if momentum_values is None:
+        momentum_values = [1, 2, 4, 8]
+
+    from matplotlib.path import Path as MplPath
+    import matplotlib.patches as mpatches
+
+    # Direction deltas (dx=East, dy=North) for the 8 headings 0-7
+    DIRS_XY = [(1,0),(1,1),(0,1),(-1,1),(-1,0),(-1,-1),(0,-1),(1,-1)]
+
+    n = len(momentum_values)
+    ncols = min(n, 4)
+    nrows = (n + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5.5 * nrows))
+    axes = np.array(axes).flatten()
+
+    radii = []
+
+    for ax, m in zip(axes, momentum_values):
+        # --- Trace path cells (m steps in each of the 8 directions) ----------
+        path_cells = []
+        x, y = 0, 0
+        for dx, dy in DIRS_XY:
+            for _ in range(m):
+                path_cells.append((x, y))
+                x += dx
+                y += dy
+
+        # --- Octagon vertices (corners at start of each segment) -------------
+        verts = []
+        vx, vy = 0, 0
+        for dx, dy in DIRS_XY:
+            verts.append((float(vx), float(vy)))
+            vx += m * dx
+            vy += m * dy
+
+        # --- Shoelace area (in cell² units) ----------------------------------
+        nv = len(verts)
+        area_cells = 0.0
+        for i in range(nv):
+            x0, y0 = verts[i]
+            x1, y1 = verts[(i + 1) % nv]
+            area_cells += x0 * y1 - x1 * y0
+        area_cells = abs(area_cells) / 2.0          # should equal 7*m^2
+
+        area_m2   = area_cells * cell_size ** 2
+        radius_m  = np.sqrt(area_m2 / np.pi)
+        radii.append(radius_m)
+
+        # Centroid of octagon
+        cx = sum(v[0] for v in verts) / nv          # = m/2
+        cy = sum(v[1] for v in verts) / nv          # = 3m/2
+
+        # --- Build raster grid -----------------------------------------------
+        all_x = [v[0] for v in verts]
+        all_y = [v[1] for v in verts]
+        pad   = max(2, m // 2 + 1)
+        x_min, x_max = int(min(all_x)) - pad, int(max(all_x)) + pad
+        y_min, y_max = int(min(all_y)) - pad, int(max(all_y)) + pad
+        gw, gh = x_max - x_min + 1, y_max - y_min + 1
+
+        grid = np.zeros((gh, gw))
+
+        # Interior cells (point-in-polygon)
+        closed = verts + [verts[0]]
+        mpl_poly = MplPath([(v[0], v[1]) for v in closed])
+        for gy in range(gh):
+            for gx in range(gw):
+                wx, wy = gx + x_min, gy + y_min
+                if mpl_poly.contains_point((wx, wy)):
+                    grid[gy, gx] = 0.4
+
+        # Path cells (drawn on top)
+        for (px, py) in path_cells:
+            gx = int(px) - x_min
+            gy = int(py) - y_min
+            if 0 <= gy < gh and 0 <= gx < gw:
+                grid[gy, gx] = 1.0
+
+        # --- Plot ------------------------------------------------------------
+        ax.imshow(
+            grid, origin='lower', cmap='Blues', vmin=0, vmax=1,
+            extent=[x_min - 0.5, x_max + 0.5, y_min - 0.5, y_max + 0.5],
+        )
+
+        # Minor grid lines at every cell
+        ax.set_xticks(np.arange(x_min, x_max + 1), minor=True)
+        ax.set_yticks(np.arange(y_min, y_max + 1), minor=True)
+        ax.grid(which='minor', color='gray', linewidth=0.3, alpha=0.4)
+        ax.tick_params(which='minor', length=0)
+
+        # Octagon outline
+        ox = [v[0] for v in verts] + [verts[0][0]]
+        oy = [v[1] for v in verts] + [verts[0][1]]
+        ax.plot(ox, oy, 'b-', linewidth=1.5)
+
+        # Equivalent circle
+        r_cells = radius_m / cell_size
+        circ = plt.Circle(
+            (cx, cy), r_cells, fill=False,
+            color='red', linestyle='--', linewidth=1.5,
+        )
+        ax.add_patch(circ)
+        ax.plot(cx, cy, 'r+', ms=8, markeredgewidth=1.5)
+
+        # Legend
+        handles = [
+            mpatches.Patch(facecolor='steelblue', label=f'Octagon  ({area_cells:.0f} cells²)'),
+            mpatches.Patch(facecolor='lightblue', label='Interior'),
+            plt.Line2D([0], [0], color='red', linestyle='--', label=f'Circle  R = {radius_m:.0f} m'),
+        ]
+        ax.legend(handles=handles, fontsize=11, loc='upper right')
+
+        ax.set_aspect('equal')
+        ax.set_title(f'momentum = {m}\nR ≈ {radius_m:.0f} m', fontsize=14)
+        ax.set_xlabel('cells (East →)', fontsize=12)
+        ax.set_ylabel('cells (North ↑)', fontsize=12)
+        ax.tick_params(axis='both', labelsize=11)
+
+    # Hide unused axes
+    for ax in axes[n:]:
+        ax.set_visible(False)
+
+    plt.suptitle(
+        f'Minimum-turn octagon and area-equivalent circle  (cell size = {cell_size} m)',
+        fontsize=16,
+    )
+    plt.tight_layout()
+    os.makedirs('temp', exist_ok=True)
+    plt.savefig('temp/bend_radius.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    # Summary table
+    print(f"\n{'momentum':>10}  {'area (cells²)':>15}  {'radius (m)':>12}")
+    print('-' * 42)
+    for m, r in zip(momentum_values, radii):
+        print(f"{m:>10}  {7*m**2:>15.0f}  {r:>12.1f}")
+
+    return dict(zip(momentum_values, radii))
+
+
 def add_noise(arr, sigma):
     """Add N(0, sigma) noise to all non-NaN, non-zero cells. NaN and 0 cells are unchanged."""
     noisy = arr + np.random.normal(0, sigma, arr.shape)
@@ -405,7 +859,9 @@ def combine_rasters(rasters, func=np.nanmean):
 if __name__ == "__main__":
     start = time.time()
     # run()
-    run_sensitivity_analysis()
+    # run_sensitivity_analysis()
     # plot_nan_map_with_cells()
+    plot_turn_rules(momentum=4, staircase_width=3, n_cycles=3)
+    # plot_bend_radius(momentum_values=[1, 2, 4, 8], cell_size=100)
     end = time.time()
     print(f"Execution time: {(end - start) / 60:.2f} minutes")
