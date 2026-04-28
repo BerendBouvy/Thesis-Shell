@@ -70,18 +70,17 @@ def main():
     
     raster_folder = "destriped_rasters"
     results = {}
-    stop = 50
     i=0
     for filename in os.listdir(raster_folder):
         i += 1
         print(f"Processing file: {filename}, number of files left: {len(os.listdir(raster_folder)) - i}")
         os.mkdir(os.path.join(folder, filename.split('.')[0]))
         
-        # if stop <= 0:
-        #     break
         id = filename.split('.')[0]
-        raster = np.load(os.path.join(raster_folder, filename))
-        bat_raster = BathymetryRaster(raster)
+        cell = id.split('_')[1]
+        cdi = id.split('_')[3]
+        # raster = np.load(os.path.join(raster_folder, filename))
+        bat_raster = BathymetryRaster(cell=cell, cdi=cdi)
         results[id] = {
             "bathymetry": bat_raster,
             "original": bat_raster.raster,
@@ -89,11 +88,11 @@ def main():
             "trend": bat_raster.trend,
             "residual": bat_raster.residual,
             "demeaned": bat_raster.raster_demeaned,
-            "std": bat_raster.local_std(bat_raster.raster_filled, size=10),
+            "std": bat_raster.local_std(bat_raster.raster_filled, size=40),
             "grad": bat_raster.local_gradient(bat_raster.raster_filled, smooth=5),
             "grad_of_grad": bat_raster.local_gradient(bat_raster.local_gradient(bat_raster.raster_filled, smooth=5), smooth=5),
-            "min": bat_raster.local_minmax(bat_raster.raster_filled, size=10)[0],
-            "max": bat_raster.local_minmax(bat_raster.raster_filled, size=10)[1]
+            # "min": bat_raster.local_minmax(bat_raster.raster_filled, size=10)[0],
+            # "max": bat_raster.local_minmax(bat_raster.raster_filled, size=10)[1]
         }
         
         bat_raster.plot_raster(results[id]["original"], title=f"Original Raster - {id}", save_path=os.path.join(folder, id, f"{id}_original.png"))
@@ -101,17 +100,17 @@ def main():
         bat_raster.plot_raster(results[id]["std"], title=f"Local Std Dev - {id}", save_path=os.path.join(folder, id, f"{id}_std.png"))
         bat_raster.plot_raster(results[id]["grad"], title=f"Local Gradient - {id}", save_path=os.path.join(folder, id, f"{id}_grad.png"))
         bat_raster.plot_raster(results[id]["grad_of_grad"], title=f"Gradient of Gradient - {id}", save_path=os.path.join(folder, id, f"{id}_grad_of_grad.png"))
-        bat_raster.plot_raster(results[id]["min"], title=f"Local Min - {id}", save_path=os.path.join(folder, id, f"{id}_min.png"))
-        bat_raster.plot_raster(results[id]["max"], title=f"Local Max - {id}", save_path=os.path.join(folder, id, f"{id}_max.png"))
+        # bat_raster.plot_raster(results[id]["min"], title=f"Local Min - {id}", save_path=os.path.join(folder, id, f"{id}_min.png"))
+        # bat_raster.plot_raster(results[id]["max"], title=f"Local Max - {id}", save_path=os.path.join(folder, id, f"{id}_max.png"))
     
-    pickle.dump(results, open(os.path.join(folder, "results_features.pkl"), "wb"))
+    pickle.dump(results, open(os.path.join(folder, "results_features2.pkl"), "wb"))
     
     
 def main2():
-    folder = "sandwave_detection_v8"
+    folder = "sandwave_detection_v4"
     if not os.path.exists(os.path.join(folder, "labels")):
         os.makedirs(os.path.join(folder, "labels"))
-    results = pickle.load(open(os.path.join(folder, "results_features.pkl"), "rb"))
+    results = pickle.load(open(os.path.join(folder, "results_features2.pkl"), "rb"))
     ss = StandardScaler()
     for id in results.keys():
         results[id]["feat"] = np.stack(

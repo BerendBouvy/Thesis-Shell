@@ -285,19 +285,43 @@ class CostMap:
 
         return self.routes
     
-    def fill_nans_nn(self):
-        """Fill NaN values in the cost map using nearest neighbor interpolation."""
+    def fill_nans_nn(self, max_gap=None):
+        """Fill NaN values in the cost map using nearest-neighbour interpolation.
+
+        Parameters
+        ----------
+        max_gap : int or None
+            Maximum size (in pixels) of a contiguous NaN region to be filled.
+            Connected NaN regions with more pixels than ``max_gap`` are left as
+            NaN; smaller holes are filled with the value of their nearest valid
+            neighbour.  ``None`` (default) fills all NaN cells regardless of
+            region size.
+        """
+        from scipy.ndimage import label
+        from scipy.spatial import cKDTree
+
         nan_mask = np.isnan(self.costs)
         if not nan_mask.any():
             return
 
+        if max_gap is not None:
+            labeled, n_components = label(nan_mask)
+            sizes = np.bincount(labeled.ravel())   # index 0 = valid cells
+            fill_mask = np.zeros_like(nan_mask)
+            for i in range(1, n_components + 1):
+                if sizes[i] <= max_gap:
+                    fill_mask |= labeled == i
+        else:
+            fill_mask = nan_mask
+
+        if not fill_mask.any():
+            return
+
         rows, cols = np.indices(self.costs.shape)
         valid = ~nan_mask
-        from scipy.spatial import cKDTree
         tree = cKDTree(np.column_stack([rows[valid], cols[valid]]))
-        _, idx = tree.query(np.column_stack([rows[nan_mask], cols[nan_mask]]))
-        valid_values = self.costs[valid]
-        self.costs[nan_mask] = valid_values[idx]
+        _, idx = tree.query(np.column_stack([rows[fill_mask], cols[fill_mask]]))
+        self.costs[fill_mask] = self.costs[valid][idx]
         
     def fill_nans_high_cost(self, high_cost=None):
         """Fill NaN values in the cost map with a specified high cost."""

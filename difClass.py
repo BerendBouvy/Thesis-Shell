@@ -269,6 +269,20 @@ class BathymetryRaster(RasterBase):
         if not hasattr(self, "angle"):
             self.find_angle()
             self.set_angle(self.best_angle_north)
+            
+    @staticmethod
+    def local_std(raster, size=5):
+        """Compute local standard deviation as a rough measure of roughness."""
+        local_std_raster = generic_filter(raster, np.nanstd, size=size)
+        return local_std_raster
+    
+    @staticmethod
+    def local_gradient(raster, smooth=None):
+        """Compute local gradient magnitude using Sobel filters."""
+        gradient = np.sqrt(sobel(raster, axis=0)**2 + sobel(raster, axis=1)**2)
+        if smooth is not None:
+            gradient = gaussian_filter(gradient, sigma=smooth)
+        return gradient
 
     
 class DifferenceRaster(RasterBase):

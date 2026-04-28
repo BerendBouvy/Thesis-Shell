@@ -113,7 +113,7 @@ def build_amplitude_costmap():
 def run():
     costmap = cm.CostMap(dx=100, dy=100, default_cost=1)
     nanmap = nan_map()
-    nanmap.plot_cost_map(cmap=cmocean.cm.deep, show=True, show_routes=False, save_path="temp/nan_map.png")  
+    # nanmap.plot_cost_map(cmap=cmocean.cm.deep, show=True, show_routes=False, save_path="temp/nan_map.png")  
     costmap1 = build_sandwave_costmap()
     costmap2 = build_variance_costmap()
     
@@ -135,12 +135,14 @@ def run():
 
     if n2000:
         costmap.block_n2000()
-    costmap.plot_cost_map(cmap='Blues', show=False, show_routes=True, save_path="temp/cost_map_before_filling.png")
+    # costmap.plot_cost_map(cmap='Blues', show=False, show_routes=True, save_path="temp/cost_map_before_filling.png")
     
-    # costmap.fill_nans_nn()
+    costmap.plot_cost_map(cmap='Reds', show=True, show_routes=True)
+    costmap.fill_nans_nn(max_gap=1000)
+    costmap.plot_cost_map(cmap='Greens', show=True, show_routes=True)
     costmap.fill_nans_high_cost()
     costmap.plot_cost_map(cmap='Blues', show=True, show_routes=True, save_path="cmap.png")
-    
+    return
     rescale_factor = 1
     # cmap_rescaled = ski.measure.block_reduce(
     #     costmap.costs,
@@ -179,7 +181,7 @@ def run():
 
 def run_sensitivity_analysis():
     n = 100
-    sigma = .1
+    sigma = .5
     var_threshold = 0.05
     amp_threshold = 0.08
     rescale_factor = 4
@@ -222,8 +224,10 @@ def run_sensitivity_analysis():
         # template.plot_cost_map(raster=costs3, cmap='Reds', show=True)
 
         base = add_noise(np.ones(shape), sigma)
-
-        combined = cm.nansum([base, costs1, costs2, costs3], axis=0)
+        
+        # weights = np.random.uniform(0, 2, size=3)
+        weights = [1, 1, 1]
+        combined = cm.nansum([base, weights[0]*costs1, weights[1]*costs2, weights[2]*costs3], axis=0)
             
         combined[nan_mask] = np.nan
         combined[np.isnan(combined)] = np.nanmax(combined)
@@ -859,9 +863,9 @@ def combine_rasters(rasters, func=np.nanmean):
 if __name__ == "__main__":
     start = time.time()
     # run()
-    # run_sensitivity_analysis()
+    run_sensitivity_analysis()
     # plot_nan_map_with_cells()
-    plot_turn_rules(momentum=4, staircase_width=3, n_cycles=3)
+    # plot_turn_rules(momentum=4, staircase_width=3, n_cycles=3)
     # plot_bend_radius(momentum_values=[1, 2, 4, 8], cell_size=100)
     end = time.time()
     print(f"Execution time: {(end - start) / 60:.2f} minutes")

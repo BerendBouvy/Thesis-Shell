@@ -40,6 +40,43 @@ DETREND_SIGMA_CHOSEN = 6    # chosen Gaussian detrending sigma (pixels = 60 m at
 NOTCH_WIDTH_CHOSEN  = 5     # chosen notch half-width (pixels in padded FFT)
 NOTCH_CENTER_SIZE   = 15    # DC-exclusion radius (matches _find_angle in destripeClass)
 
+# ---------------------------------------------------------------------------
+# Sandwave-detection constants
+# ---------------------------------------------------------------------------
+
+SWD_CELL        = 47
+SWD_CDI         = 3844669
+SWD_RASTER_PATH = (f"destriped_rasters/cell_{SWD_CELL}_CDI_{SWD_CDI}_destriped.npy")
+SWD_LABELS_PATH = (f"sandwave_detection_v8/labels/"
+                   f"cell_{SWD_CELL}_CDI_{SWD_CDI}_destriped_labels_smoothed.npy")
+
+SWD_DETREND_SIGMA = 30   # pixels  (= 600 m at 20 m/px)
+SWD_STD_SIZE      = 10   # pixels  (= 200 m)
+SWD_GRAD_SMOOTH   = 5    # pixels  (= 100 m)
+
+CMAP_FEAT        = "inferno"
+SW_CONTOUR_COLOR = "#00e676"   # bright green for the sandwave boundary
+
+# Label-cleaning hyperparameters (from detect_sws.clean_smoothed_labels)
+SWD_CLEAN_SIGMA   = 20    # px  Gaussian smoothing sigma
+SWD_CLEAN_THRESH  = 0.35  # binary threshold on smoothed probability
+SWD_CLOSING_ITER  = 2     # binary closing iterations (3×3 structure)
+SWD_MIN_PIXELS    = 200   # minimum connected component size (px)
+SWD_RAW_LABELS_PATH = (f"sandwave_detection_v8/labels/"
+                        f"cell_{SWD_CELL}_CDI_{SWD_CDI}_destriped_labels.npy")
+
+# Erosion-effect example (cell 14 – thin features make erosion visible)
+SWD_EROSION_CELL = 14
+SWD_EROSION_CDI  = 3844669
+SWD_EROSION_RASTER_PATH = (f"destriped_rasters/"
+                            f"cell_{SWD_EROSION_CELL}_CDI_{SWD_EROSION_CDI}_destriped.npy")
+SWD_EROSION_RAW_PATH    = (f"sandwave_detection_v8/labels/"
+                            f"cell_{SWD_EROSION_CELL}_CDI_{SWD_EROSION_CDI}"
+                            f"_destriped_labels.npy")
+SWD_EROSION_SMOOTH_PATH = (f"sandwave_detection_v8/labels/"
+                            f"cell_{SWD_EROSION_CELL}_CDI_{SWD_EROSION_CDI}"
+                            f"_destriped_labels_smoothed.npy")
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -631,6 +668,124 @@ def _windowed_padded_fft(data):
     padded = np.pad(data * window, pad, mode="constant")
     F      = np.fft.fftshift(np.fft.fft2(padded))
     return np.log(np.abs(F) + 1)
+
+
+# ---------------------------------------------------------------------------
+# Sandwave-detection helpers
+# ---------------------------------------------------------------------------
+
+def _load_swd():
+    """Load, demean, and NaN-fill the sandwave detection example raster."""
+    return _fill_raster_path(SWD_RASTER_PATH)
+
+
+def _load_swd_labels():
+    """Load smoothed binary labels (−1=no-data, 0=flat seabed, 1=sandwave)."""
+    return np.load(SWD_LABELS_PATH)
+
+
+def _local_std(data, size):
+    """Local standard deviation in a size × size sliding window.
+
+    Uses Var[x] = E[x²] − E[x]² computed via uniform_filter → O(N).
+    """
+    E_x2 = ndimage.uniform_filter(data ** 2, size=size)
+    E_x  = ndimage.uniform_filter(data,      size=size)
+    return np.sqrt(np.maximum(E_x2 - E_x ** 2, 0.0))
+
+
+def _local_grad(data, smooth):
+    """Gradient magnitude |∇f| after Gaussian pre-smoothing (σ = smooth pixels)."""
+    smoothed = ndimage.gaussian_filter(data, sigma=smooth)
+    gy, gx   = np.gradient(smoothed)
+    return np.sqrt(gx ** 2 + gy ** 2)
+
+
+def _sw_contour(ax, labels, lw=1.5):
+    """Overlay the sandwave-area boundary on *ax* as a contour line."""
+    mask = (labels == 1).astype(float)
+    if mask.any():
+        ax.contour(mask, levels=[0.5], colors=[SW_CONTOUR_COLOR],
+                   linewidths=lw, alpha=0.9)
+
+
+def _labels_cmap_norm():
+    """3-class colormap/norm for label images (−1→gray, 0→white, 1→red)."""
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+    cmap = ListedColormap(["#cccccc", "white", "#e53935"])
+    norm = BoundaryNorm([-1.5, -0.5, 0.5, 1.5], 3)
+    return cmap, norm
+
+
+def _load_swd_raw_labels():
+    """Load raw (un-cleaned) K-Means labels (−1=no-data, 0=flat, 1=sandwave)."""
+    return np.load(SWD_RAW_LABELS_PATH)
+
+
+def _clean_steps(labels_for_clean, valid_mask, sigma, threshold, closing_iter, min_pixels):
+    """
+    Re-implement clean_smoothed_labels step-by-step and return intermediates.
+
+    Parameters
+    ----------
+    labels_for_clean : int ndarray  (0 or 1 only — no −1 values)
+    valid_mask       : bool ndarray (True where bathymetry data is valid)
+
+    Returns a dict with keys:
+      smoothed_float  — continuous probability 0–1 (NaN outside valid area)
+      after_threshold — label image after thresholding
+      after_closing   — after binary closing
+      after_fillholes — after fill_holes
+      final           — after removing components smaller than min_pixels
+    Label images use −1=no-data, 0=flat, 1=sandwave convention.
+    """
+    labels_f = labels_for_clean.astype(np.float32)
+    valid_f  = valid_mask.astype(np.float32)
+
+    # Step 1: support-normalised Gaussian smoothing
+    weighted = ndimage.gaussian_filter(labels_f * valid_f, sigma=sigma, mode="nearest")
+    support  = ndimage.gaussian_filter(valid_f,            sigma=sigma, mode="nearest")
+    smooth_f = np.divide(weighted, support,
+                         out=np.zeros_like(weighted, dtype=np.float32),
+                         where=support > 1e-6)
+
+    # Step 2: threshold + restrict to valid pixels
+    binary = (smooth_f > threshold) & valid_mask
+
+    # Step 3: binary closing (bridges small gaps)
+    closed = ndimage.binary_closing(
+        binary,
+        structure=np.ones((3, 3), dtype=bool),
+        iterations=closing_iter,
+        border_value=1,
+    )
+
+    # Step 4: fill internal holes
+    filled = ndimage.binary_fill_holes(closed)
+
+    # Step 5: remove components smaller than min_pixels
+    lab_comp, n_comp = ndimage.label(filled)
+    if n_comp > 0:
+        sizes     = np.bincount(lab_comp.ravel())
+        keep      = sizes >= min_pixels
+        keep[0]   = False
+        final_bin = keep[lab_comp]
+    else:
+        final_bin = filled.copy()
+
+    def _to_label(mask):
+        out = np.zeros(labels_for_clean.shape, dtype=np.int8)
+        out[mask]         = 1
+        out[~valid_mask]  = -1
+        return out
+
+    return {
+        "smoothed_float":  np.where(valid_mask, smooth_f.astype(float), np.nan),
+        "after_threshold": _to_label(binary),
+        "after_closing":   _to_label(closed),
+        "after_fillholes": _to_label(filled),
+        "final":           _to_label(final_bin),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1402,6 +1557,2910 @@ def plot_angle_detection(save_path=None):
 
 
 # ---------------------------------------------------------------------------
+# Figure 12 — Why filtering uses the unwindowed FFT (invertibility argument)
+# ---------------------------------------------------------------------------
+
+def plot_windowed_vs_unwindowed_filtering(save_path=None):
+    """
+    Two-row diagram showing why the notch filter is applied to the
+    *unwindowed* FFT rather than the windowed one.
+
+    Windowing (Hann) is useful for angle detection: it suppresses spectral
+    leakage so stripe peaks stand out clearly.  But filtering the windowed
+    FFT and inverting does NOT give the filtered residuals — it gives a
+    windowed version of them.  To recover the true filtered residuals one
+    would divide by the window, which amplifies the near-zero edge weights
+    (eps-clipped to 0.01) by up to 100×, producing catastrophic artefacts.
+
+    The pipeline avoids this by keeping two parallel FFT paths:
+      • Windowed FFT  → angle detection only.
+      • Unwindowed FFT → notch filtering; iFFT is directly the filtered
+        residuals with no division or correction required.
+
+    Layout: 2 rows × 4 columns
+      Row 0  (windowed path — not used for filtering):
+        Col 0  Residuals × Hann window (spatial input, edges ≈ 0).
+        Col 1  FFT log|F|  (clean spectrum; used for angle detection).
+        Col 2  iFFT after notch (output is windowed → edges still ≈ 0).
+        Col 3  ÷ Hann window to recover residuals → edge artefacts explode.
+      Row 1  (unwindowed path — pipeline):
+        Col 0  Residuals (full amplitude, unmodified).
+        Col 1  FFT log|F|  (some spectral leakage, acceptable for filtering).
+        Col 2  iFFT after notch (correctly filtered residuals, clean edges).
+        Col 3  Removed stripes = residuals − filtered (clean stripe shape).
+
+    Orange border = correct path.  Red border = problematic panel.
+    """
+    print("  Filling NaNs…", flush=True)
+    filled, mean_val, nan_mask = _fill_raster()
+    _, residuals = _gaussian_detrend(filled, DETREND_SIGMA_CHOSEN)
+
+    h, w = residuals.shape
+
+    # ---- 2-D Hann window, eps-clipped (mirrors destripeClass._apply_window) ----
+    window   = np.outer(np.hanning(h), np.hanning(w))
+    eps      = 1e-2
+    win_clip = np.where(window < eps, eps, window)
+    windowed = residuals * win_clip
+
+    # ---- Zero-padding (mirrors destripeClass._apply_padding) ----
+    pad            = max(h, w) // 2
+    unpadded_slice = (slice(pad, pad + h), slice(pad, pad + w))
+    win_padded     = np.pad(windowed,  pad, mode="constant")
+    nowin_padded   = np.pad(residuals, pad, mode="constant")
+
+    # ---- FFTs ----
+    F_win   = np.fft.fftshift(np.fft.fft2(win_padded))
+    F_nowin = np.fft.fftshift(np.fft.fft2(nowin_padded))
+    log_win   = np.log(np.abs(F_win)   + 1)
+    log_nowin = np.log(np.abs(F_nowin) + 1)
+
+    # ---- Detect stripe angle from windowed FFT ----
+    print("  Detecting stripe angle…", flush=True)
+    angle, _, _ = _find_stripe_angle(log_win)
+    print(f"  Detected angle: {angle:.0f}°", flush=True)
+
+    # ---- Build rotated notch (padded-array shape) ----
+    hp, wp = win_padded.shape
+    base   = np.zeros((hp, wp), dtype=float)
+    for i in range(-NOTCH_WIDTH_CHOSEN, NOTCH_WIDTH_CHOSEN + 1):
+        base += np.eye(hp, wp, k=i)
+    cy, cx = hp // 2, wp // 2
+    base[cy - NOTCH_CENTER_SIZE:cy + NOTCH_CENTER_SIZE,
+         cx - NOTCH_CENTER_SIZE:cx + NOTCH_CENTER_SIZE] = 0
+    notch = np.clip(
+        ndimage.rotate(np.clip(base, 0, 1), float(angle), reshape=False),
+        0, 1,
+    )
+
+    # ---- Windowed path ----
+    ifft_win_crop = np.real(
+        np.fft.ifft2(np.fft.ifftshift(F_win * (1.0 - notch)))
+    )[unpadded_slice]                           # windowed filtered residuals
+    recovered_win = ifft_win_crop / win_clip    # ÷ window → edge blow-up
+
+    # ---- Unwindowed path (pipeline) ----
+    filtered_nowin = np.real(
+        np.fft.ifft2(np.fft.ifftshift(F_nowin * (1.0 - notch)))
+    )[unpadded_slice]                           # correctly filtered residuals
+    removed_nowin = residuals - filtered_nowin  # actual stripes extracted
+
+    # ---- Colour limits ----
+    res_lim      = float(np.max(np.abs(residuals)))
+    removed_lim  = float(np.max(np.abs(removed_nowin)))
+    blowup_lim   = float(np.max(np.abs(recovered_win)))   # will be >> res_lim
+    fft_max      = max(log_win.max(), log_nowin.max())
+
+    # ---- Layout: 2 rows × 4 cols ----
+    fig, axes = plt.subplots(2, 4, figsize=(22, 10))
+    fig.subplots_adjust(hspace=0.13, wspace=0.06,
+                        left=0.10, right=0.97, top=0.88, bottom=0.09)
+
+    col_titles = [
+        "Spatial input",
+        f"FFT  log|F|  (θ = {angle:.0f}°)",
+        "iFFT  after notch",
+        "Final step",
+    ]
+    row_labels = [
+        "Windowed path\n(not used for filtering)",
+        "Unwindowed path\n(pipeline)",
+    ]
+
+    # ---- Row 0: windowed path ----
+    axes[0][0].imshow(windowed,      cmap="RdBu_r", origin="upper",
+                      vmin=-res_lim,    vmax=res_lim)
+    axes[0][1].imshow(log_win,       cmap="hot",    origin="upper",
+                      vmin=0,           vmax=fft_max)
+    axes[0][2].imshow(ifft_win_crop, cmap="RdBu_r", origin="upper",
+                      vmin=-res_lim,    vmax=res_lim)
+    axes[0][3].imshow(recovered_win, cmap="RdBu_r", origin="upper",
+                      vmin=-blowup_lim, vmax=blowup_lim)
+
+    # ---- Row 1: unwindowed path (pipeline) ----
+    axes[1][0].imshow(residuals,      cmap="RdBu_r", origin="upper",
+                      vmin=-res_lim,   vmax=res_lim)
+    axes[1][1].imshow(log_nowin,      cmap="hot",    origin="upper",
+                      vmin=0,          vmax=fft_max)
+    axes[1][2].imshow(filtered_nowin, cmap="RdBu_r", origin="upper",
+                      vmin=-res_lim,   vmax=res_lim)
+    axes[1][3].imshow(removed_nowin,  cmap="RdBu_r", origin="upper",
+                      vmin=-removed_lim, vmax=removed_lim)
+
+    # ---- Annotations ----
+    def _ann(ax, text, color="white", bg="#333333", fw="normal"):
+        ax.text(0.03, 0.97, text, transform=ax.transAxes,
+                ha="left", va="top", fontsize=FS - 3, color=color,
+                fontweight=fw,
+                bbox=dict(boxstyle="round,pad=0.25", facecolor=bg,
+                          alpha=0.80, edgecolor="none"))
+
+    _ann(axes[0][0], "edges → 0\n(Hann window)")
+    _ann(axes[0][2], "output windowed\n(edges still ≈ 0)")
+    _ann(axes[0][3],
+         f"edge artefacts\n(max {blowup_lim:.2f} m  ≈  {blowup_lim/res_lim:.0f}× residual range)",
+         color="#cc0000", bg="white", fw="bold")
+    _ann(axes[1][1], "spectral leakage\n(acceptable for filtering)")
+    _ann(axes[1][3], f"max removal: {removed_lim:.2f} m\n(stripe signal only)")
+
+    # ---- Titles, row labels, tick removal ----
+    for c, title in enumerate(col_titles):
+        axes[0][c].set_title(title, fontsize=FS_TITLE, pad=7)
+    for r, lbl in enumerate(row_labels):
+        axes[r][0].set_ylabel(lbl, fontsize=FS, labelpad=8)
+    for r in range(2):
+        for c in range(4):
+            axes[r][c].set_xticks([])
+            axes[r][c].set_yticks([])
+
+    # ---- Spine highlighting ----
+    for c in range(4):                                    # orange = correct row
+        for sp in axes[1][c].spines.values():
+            sp.set_edgecolor(HIGHLIGHT_COLOR); sp.set_linewidth(2.5)
+    for sp in axes[0][3].spines.values():                # red = problem panel
+        sp.set_edgecolor("#cc0000"); sp.set_linewidth(2.5)
+
+    # ---- Arrows between columns ----
+    for r in range(2):
+        for c in range(3):
+            axes[r][c].annotate(
+                "", xy=(1.04, 0.5), xycoords="axes fraction",
+                xytext=(1.0,  0.5), textcoords="axes fraction",
+                arrowprops=dict(arrowstyle="->", color="#555555", lw=1.5))
+
+    # ---- Colorbars (one per column, below bottom row) ----
+    fig.canvas.draw()
+    cbar_y, cbar_h = 0.025, 0.018
+    # Col 3 has different scales per row — use row 1 (correct) for the bar label
+    col3_ref_img = axes[1][3].images[0]
+    ref_imgs  = [axes[0][0].images[0], axes[0][1].images[0],
+                 axes[0][2].images[0], col3_ref_img]
+    col_units = ["Residual (m)", "log |F|", "Residual (m)", "Signal (m)"]
+    for c in range(4):
+        pos = axes[1][c].get_position()
+        cax = fig.add_axes([pos.x0, cbar_y, pos.width, cbar_h])
+        cb  = fig.colorbar(ref_imgs[c], cax=cax, orientation="horizontal")
+        cb.set_label(col_units[c], fontsize=FS - 2)
+        cb.ax.tick_params(labelsize=FS - 4)
+
+    fig.suptitle(
+        "Why the notch filter is applied to the unwindowed FFT",
+        fontsize=FS_TITLE + 1, fontweight="bold", y=0.96)
+
+    _save_or_show(fig, save_path)
+
+
+# ---------------------------------------------------------------------------
+# Figure 13 — Sandwave detection: residuals (detrending sigma comparison)
+# ---------------------------------------------------------------------------
+
+def plot_swd_residuals(save_path=None):
+    """
+    Justify the Gaussian detrending sigma = 30 px (600 m) for residual extraction.
+
+    Layout: 2 rows × 5 columns (σ = 5, 15, 30, 60, 100 px)
+      Row 0  Gaussian trend surface.
+      Row 1  Residual = filled − trend, with sandwave boundary (green contour).
+
+    Small σ → trend too localised → residual noisy, sandwave signal diluted.
+    Large σ → trend over-smooth  → residual retains large-scale bathymetric slope.
+    Chosen σ = 30 px (600 m) is highlighted with an orange border.
+    """
+    from matplotlib.lines import Line2D
+
+    print("  Loading sandwave raster …", flush=True)
+    filled, mean_val, nan_mask = _load_swd()
+    labels = _load_swd_labels()
+
+    sigmas     = [5, 15, 30, 60, 100]
+    chosen_idx = sigmas.index(SWD_DETREND_SIGMA)
+
+    all_tr, all_res = [], []
+    for s in sigmas:
+        tr, res = _gaussian_detrend(filled, s)
+        all_tr.append(tr)
+        all_res.append(res)
+
+    vmin    = float(np.nanmin(filled + mean_val))
+    vmax    = float(np.nanmax(filled + mean_val))
+    res_abs = float(max(np.max(np.abs(r)) for r in all_res))
+
+    cm_bath = copy.copy(CMAP_BATH);   cm_bath.set_bad(NAN_COLOR)
+    cm_rdbu = copy.copy(plt.cm.RdBu_r); cm_rdbu.set_bad(NAN_COLOR)
+
+    n_rows, n_cols = 2, len(sigmas)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(22, 9))
+    fig.subplots_adjust(hspace=0.08, wspace=0.06,
+                        left=0.09, right=0.97, top=0.88, bottom=0.13)
+
+    im_tr_ref = im_res_ref = None
+    for c, (s, tr, res) in enumerate(zip(sigmas, all_tr, all_res)):
+        ax0, ax1 = axes[0][c], axes[1][c]
+
+        # Row 0 — trend
+        im_tr = ax0.imshow(
+            np.ma.masked_where(nan_mask, tr + mean_val),
+            cmap=cm_bath, origin="upper", vmin=vmin, vmax=vmax)
+        ax0.set_xticks([]); ax0.set_yticks([])
+        ax0.set_title(f"σ = {s} px  ({s * 20} m)", fontsize=FS_TITLE, pad=6)
+        if c == 0:
+            ax0.set_ylabel("Gaussian trend", fontsize=FS, labelpad=8)
+
+        # Row 1 — residual + labels contour
+        im_res = ax1.imshow(
+            np.ma.masked_where(nan_mask, res),
+            cmap=cm_rdbu, origin="upper", vmin=-res_abs, vmax=res_abs)
+        ax1.set_xticks([]); ax1.set_yticks([])
+        _sw_contour(ax1, labels)
+        if c == 0:
+            ax1.set_ylabel("Residual = filled − trend", fontsize=FS, labelpad=8)
+
+        # Orange border for chosen column
+        if c == chosen_idx:
+            im_tr_ref = im_tr
+            im_res_ref = im_res
+            for r in range(n_rows):
+                for sp in axes[r][c].spines.values():
+                    sp.set_edgecolor(HIGHLIGHT_COLOR); sp.set_linewidth(3)
+
+    # Green contour legend
+    leg = [Line2D([0], [0], color=SW_CONTOUR_COLOR, lw=1.5,
+                  label="sandwave area (smoothed labels)")]
+    axes[1][-1].legend(handles=leg, fontsize=FS - 3, loc="lower right",
+                       framealpha=0.85, edgecolor="#aaaaaa")
+
+    # Colorbars — two side-by-side spanning full plot width
+    fig.canvas.draw()
+    cbar_y, cbar_h = 0.040, 0.022
+    pos_tl = axes[0][0].get_position()
+    pos_tr = axes[0][-1].get_position()
+    full_w = pos_tr.x1 - pos_tl.x0
+    half_w = full_w * 0.47
+
+    cax0 = fig.add_axes([pos_tl.x0,              cbar_y, half_w, cbar_h])
+    cax1 = fig.add_axes([pos_tl.x0 + full_w * 0.53, cbar_y, half_w, cbar_h])
+
+    cb0 = fig.colorbar(im_tr_ref,  cax=cax0, orientation="horizontal")
+    cb0.set_label("Depth (m)",     fontsize=FS - 1)
+    cb0.ax.tick_params(labelsize=FS - 3)
+
+    cb1 = fig.colorbar(im_res_ref, cax=cax1, orientation="horizontal")
+    cb1.set_label("Residual (m)",  fontsize=FS - 1)
+    cb1.ax.tick_params(labelsize=FS - 3)
+
+    fig.suptitle(
+        f"Detrending sigma — residual feature  "
+        f"(chosen: σ = {SWD_DETREND_SIGMA} px = {SWD_DETREND_SIGMA * 20} m)",
+        fontsize=FS_TITLE + 1, fontweight="bold", y=0.96)
+
+    _save_or_show(fig, save_path)
+
+
+# ---------------------------------------------------------------------------
+# Figure 14 — Sandwave detection: local standard deviation (window-size comparison)
+# ---------------------------------------------------------------------------
+
+def plot_swd_local_std(save_path=None):
+    """
+    Justify the local-std window size = 10 px (200 m) for sandwave feature extraction.
+
+    Layout: 1 row × 6 columns (window sizes 3, 5, 10, 20, 40 px + labels reference)
+      Each panel shows the local σ(z) map with the sandwave boundary as a green
+      contour.  The last column shows the smoothed classification labels.
+
+    Small window → local std noisy, reflects instrument noise more than bedform relief.
+    Large window → local std over-smoothed, loses spatial resolution of sandwave fields.
+    Chosen size = 10 px (200 m) highlighted with orange border.
+    """
+    from matplotlib.lines import Line2D
+
+    print("  Loading sandwave raster …", flush=True)
+    filled, mean_val, nan_mask = _load_swd()
+    labels = _load_swd_labels()
+    cmap_lab, norm_lab = _labels_cmap_norm()
+
+    # Compute residuals first (local std is applied to residuals, consistent with detect_sws)
+    _, residuals = _gaussian_detrend(filled, SWD_DETREND_SIGMA)
+
+    sizes      = [3, 5, 10, 20, 40]
+    chosen_idx = sizes.index(SWD_STD_SIZE)
+
+    all_std = []
+    for sz in sizes:
+        s = _local_std(residuals, sz)
+        s[nan_mask] = np.nan
+        all_std.append(s)
+
+    feat_max = float(max(np.nanmax(s) for s in all_std))
+
+    cm_feat = copy.copy(plt.colormaps[CMAP_FEAT]); cm_feat.set_bad(NAN_COLOR)
+
+    n_cols = len(sizes) + 1   # last col = labels
+    fig, axes = plt.subplots(1, n_cols, figsize=(22, 5))
+    fig.subplots_adjust(wspace=0.06, left=0.03, right=0.97, top=0.84, bottom=0.17)
+
+    im_feat_ref = None
+    for c, (sz, std_map) in enumerate(zip(sizes, all_std)):
+        ax = axes[c]
+        im = ax.imshow(
+            np.ma.masked_where(nan_mask, std_map),
+            cmap=cm_feat, origin="upper", vmin=0, vmax=feat_max)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title(f"size = {sz} px\n({sz * 20} m)", fontsize=FS_TITLE, pad=5)
+        _sw_contour(ax, labels)
+
+        if c == chosen_idx:
+            im_feat_ref = im
+            for sp in ax.spines.values():
+                sp.set_edgecolor(HIGHLIGHT_COLOR); sp.set_linewidth(3)
+
+    # Labels reference panel (last column)
+    ax_lab = axes[-1]
+    ax_lab.imshow(labels, cmap=cmap_lab, norm=norm_lab, origin="upper")
+    ax_lab.set_xticks([]); ax_lab.set_yticks([])
+    ax_lab.set_title("Smoothed labels\n(reference)", fontsize=FS_TITLE, pad=5)
+    for sp in ax_lab.spines.values():
+        sp.set_edgecolor("#555555"); sp.set_linewidth(1.5)
+
+    # Legend
+    leg = [Line2D([0], [0], color=SW_CONTOUR_COLOR, lw=1.5,
+                  label="sandwave area boundary")]
+    axes[chosen_idx].legend(handles=leg, fontsize=FS - 3, loc="lower right",
+                            framealpha=0.85, edgecolor="#aaaaaa")
+
+    # Colorbar (below feature columns only)
+    fig.canvas.draw()
+    cbar_y, cbar_h = 0.055, 0.025
+    pos0 = axes[0].get_position()
+    pos4 = axes[len(sizes) - 1].get_position()
+    cax = fig.add_axes([pos0.x0, cbar_y, pos4.x1 - pos0.x0, cbar_h])
+    cb  = fig.colorbar(im_feat_ref, cax=cax, orientation="horizontal")
+    cb.set_label("Local std dev  σ(z)  (m)", fontsize=FS - 1)
+    cb.ax.tick_params(labelsize=FS - 3)
+
+    fig.suptitle(
+        f"Local standard deviation window size — sandwave feature  "
+        f"(chosen: {SWD_STD_SIZE} px = {SWD_STD_SIZE * 20} m)",
+        fontsize=FS_TITLE + 1, fontweight="bold", y=0.97)
+
+    _save_or_show(fig, save_path)
+
+
+# ---------------------------------------------------------------------------
+# Figure 15 — Sandwave detection: gradient features (pre-smoothing sigma comparison)
+# ---------------------------------------------------------------------------
+
+def plot_swd_gradient_features(save_path=None):
+    """
+    Justify the gradient pre-smoothing sigma = 5 px (100 m) used for both
+    the local gradient |∇z| and the gradient-of-gradient |∇|∇z|| features.
+
+    Layout: 2 rows × 6 columns  (smooth σ = 1, 2, 5, 10, 20 px + labels reference)
+      Row 0  |∇z|          — gradient magnitude after Gaussian smoothing.
+      Row 1  |∇|∇z||       — gradient of gradient (second-order variation / curvature).
+    Both rows share the same five σ values; the last column shows the sandwave labels.
+
+    Small σ → raw sensor noise amplified by differentiation → speckled gradient maps.
+    Large σ → over-smoothed → sandwave-scale slope / curvature signal lost.
+    Chosen σ = 5 px (100 m) highlighted with orange border.
+    """
+    from matplotlib.lines import Line2D
+
+    print("  Loading sandwave raster …", flush=True)
+    filled, mean_val, nan_mask = _load_swd()
+    labels = _load_swd_labels()
+    cmap_lab, norm_lab = _labels_cmap_norm()
+
+    _, residuals = _gaussian_detrend(filled, SWD_DETREND_SIGMA)
+
+    smooths    = [1, 2, 5, 10, 20]
+    chosen_idx = smooths.index(SWD_GRAD_SMOOTH)
+
+    all_grad, all_grad2 = [], []
+    for sm in smooths:
+        g  = _local_grad(residuals, sm);   g[nan_mask]  = np.nan
+        g2 = _local_grad(_local_grad(residuals, sm), sm); g2[nan_mask] = np.nan
+        all_grad.append(g)
+        all_grad2.append(g2)
+
+    # Per-panel 99th-percentile colour limits so smoothed panels are not washed out.
+    grad_vmaxes  = [float(np.nanpercentile(g,  99)) for g in all_grad]
+    grad2_vmaxes = [float(np.nanpercentile(g2, 99)) for g2 in all_grad2]
+    # Reference limits for the colorbars: use the chosen parameter's panel
+    grad_max_ref  = grad_vmaxes[chosen_idx]
+    grad2_max_ref = grad2_vmaxes[chosen_idx]
+
+    cm_feat = copy.copy(plt.colormaps[CMAP_FEAT]); cm_feat.set_bad(NAN_COLOR)
+
+    n_rows = 2
+    n_cols = len(smooths) + 1   # last col = labels
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(22, 9))
+    fig.subplots_adjust(hspace=0.08, wspace=0.06,
+                        left=0.09, right=0.97, top=0.88, bottom=0.13)
+
+    im_g_ref = im_g2_ref = None
+    for c, (sm, g, g2) in enumerate(zip(smooths, all_grad, all_grad2)):
+        ax0, ax1 = axes[0][c], axes[1][c]
+
+        # Row 0 — gradient magnitude (per-panel scale)
+        im_g = ax0.imshow(
+            np.ma.masked_where(nan_mask, g),
+            cmap=cm_feat, origin="upper", vmin=0, vmax=grad_vmaxes[c])
+        ax0.set_xticks([]); ax0.set_yticks([])
+        ax0.set_title(f"σ = {sm} px  ({sm * 20} m)", fontsize=FS_TITLE, pad=6)
+        _sw_contour(ax0, labels)
+        if c == 0:
+            ax0.set_ylabel("|∇z|  gradient magnitude", fontsize=FS, labelpad=8)
+
+        # Row 1 — gradient of gradient (per-panel scale)
+        im_g2 = ax1.imshow(
+            np.ma.masked_where(nan_mask, g2),
+            cmap=cm_feat, origin="upper", vmin=0, vmax=grad2_vmaxes[c])
+        ax1.set_xticks([]); ax1.set_yticks([])
+        _sw_contour(ax1, labels)
+        if c == 0:
+            ax1.set_ylabel("|∇|∇z||  gradient of gradient", fontsize=FS, labelpad=8)
+
+        # Per-panel scale annotation (top-right corner)
+        ax0.text(0.97, 0.97, f"max={grad_vmaxes[c]:.3f}",
+                 transform=ax0.transAxes, ha="right", va="top",
+                 fontsize=FS - 4, color="white",
+                 bbox=dict(boxstyle="round,pad=0.2", facecolor="#333333",
+                           alpha=0.75, edgecolor="none"))
+        ax1.text(0.97, 0.97, f"max={grad2_vmaxes[c]:.4f}",
+                 transform=ax1.transAxes, ha="right", va="top",
+                 fontsize=FS - 4, color="white",
+                 bbox=dict(boxstyle="round,pad=0.2", facecolor="#333333",
+                           alpha=0.75, edgecolor="none"))
+
+        # Orange border for chosen column
+        if c == chosen_idx:
+            im_g_ref  = im_g
+            im_g2_ref = im_g2
+            for r in range(n_rows):
+                for sp in axes[r][c].spines.values():
+                    sp.set_edgecolor(HIGHLIGHT_COLOR); sp.set_linewidth(3)
+
+    # Labels reference column (last)
+    for r in range(n_rows):
+        ax_lab = axes[r][-1]
+        ax_lab.imshow(labels, cmap=cmap_lab, norm=norm_lab, origin="upper")
+        ax_lab.set_xticks([]); ax_lab.set_yticks([])
+        if r == 0:
+            ax_lab.set_title("Smoothed labels\n(reference)", fontsize=FS_TITLE, pad=6)
+        for sp in ax_lab.spines.values():
+            sp.set_edgecolor("#555555"); sp.set_linewidth(1.5)
+
+    # Legend
+    leg = [Line2D([0], [0], color=SW_CONTOUR_COLOR, lw=1.5,
+                  label="sandwave area boundary")]
+    axes[0][chosen_idx].legend(handles=leg, fontsize=FS - 3, loc="lower right",
+                                framealpha=0.85, edgecolor="#aaaaaa")
+
+    # Colorbars — one per row, spanning feature columns only
+    fig.canvas.draw()
+    cbar_y, cbar_h = 0.040, 0.022
+    pos0  = axes[0][0].get_position()
+    pos_e = axes[0][len(smooths) - 1].get_position()
+    feat_w = pos_e.x1 - pos0.x0
+    half_w = feat_w * 0.47
+
+    cax0 = fig.add_axes([pos0.x0,              cbar_y, half_w, cbar_h])
+    cax1 = fig.add_axes([pos0.x0 + feat_w * 0.53, cbar_y, half_w, cbar_h])
+
+    cb0 = fig.colorbar(im_g_ref,  cax=cax0, orientation="horizontal")
+    cb0.set_label(f"|∇z|  (m/px)  — scale shown for chosen σ={SWD_GRAD_SMOOTH} px",
+                  fontsize=FS - 1)
+    cb0.ax.tick_params(labelsize=FS - 3)
+
+    cb1 = fig.colorbar(im_g2_ref, cax=cax1, orientation="horizontal")
+    cb1.set_label(f"|∇|∇z||  (m/px²)  — scale shown for chosen σ={SWD_GRAD_SMOOTH} px",
+                  fontsize=FS - 1)
+    cb1.ax.tick_params(labelsize=FS - 3)
+
+    # Note about independent scaling
+    fig.text(0.97, 0.005, "colour scale is independent per panel  (99th-percentile max)",
+             ha="right", va="bottom", fontsize=FS - 4, color="#555555", style="italic")
+
+    fig.suptitle(
+        f"Gradient features — pre-smoothing sigma  "
+        f"(chosen: σ = {SWD_GRAD_SMOOTH} px = {SWD_GRAD_SMOOTH * 20} m)",
+        fontsize=FS_TITLE + 1, fontweight="bold", y=0.96)
+
+    _save_or_show(fig, save_path)
+
+
+# ---------------------------------------------------------------------------
+# Figure 20 — Closing: kernel size and threshold comparison (cell 47)
+# ---------------------------------------------------------------------------
+
+def plot_swd_closing_effect(save_path=None):
+    """
+    Show the full pipeline leading into binary closing and the effect of kernel size.
+
+    Layout: 3 rows × 5 columns  (kernel sizes: 1×1, 3×3, 5×5, 7×7, 9×9)
+      Row 0  Gaussian-smoothed probability map (σ=20) — shared input, same for all cols.
+             The threshold value is marked on the shared colorbar below this row.
+      Row 1  Binary after threshold  t=0.35 — the direct input to closing, same for all.
+      Row 2  Result after binary closing with that kernel (2 iterations).
+             Green contour = chosen full-pipeline boundary.
+
+    Rows 0 and 1 are constant across columns; they show exactly what closing operates on.
+    Row 2 shows how kernel size controls how much gap-bridging occurs.
+    Orange border = chosen 3×3 column.
+    """
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
+
+    print("  Loading sandwave labels (cell 47) …", flush=True)
+    _, _, nan_mask = _load_swd()
+    valid_mask  = ~nan_mask
+    labels_raw  = _load_swd_raw_labels()
+    labels_bin  = np.where(labels_raw < 0, 0, labels_raw)
+    labels_ref  = _load_swd_labels()
+
+    kernel_sizes = [1, 3, 5, 7, 9]
+    chosen_idx   = kernel_sizes.index(3)
+
+    # ---- Compute the shared smoothed map and binary-threshold input ----
+    labels_f = labels_bin.astype(np.float32)
+    valid_f  = valid_mask.astype(np.float32)
+    weighted = ndimage.gaussian_filter(labels_f * valid_f,
+                                       sigma=SWD_CLEAN_SIGMA, mode="nearest")
+    support  = ndimage.gaussian_filter(valid_f, sigma=SWD_CLEAN_SIGMA, mode="nearest")
+    smooth_f = np.divide(weighted, support,
+                         out=np.zeros_like(weighted, dtype=np.float32),
+                         where=support > 1e-6)
+    smooth_display = np.where(valid_mask, smooth_f.astype(float), np.nan)
+
+    binary = (smooth_f > SWD_CLEAN_THRESH) & valid_mask
+    binary_lbl = np.where(~valid_mask, -1, binary.astype(np.int8)).astype(np.int8)
+
+    # ---- Closing results for each kernel size ----
+    def _close(ksize):
+        struct = np.ones((ksize, ksize), dtype=bool)
+        closed = ndimage.binary_closing(binary, structure=struct,
+                                        iterations=SWD_CLOSING_ITER, border_value=1)
+        out = np.zeros(binary.shape, dtype=np.int8)
+        out[closed] = 1; out[~valid_mask] = -1
+        return out
+
+    closed_results = [_close(k) for k in kernel_sizes]
+
+    cmap_lab, norm_lab = _labels_cmap_norm()
+    cm_smooth = copy.copy(plt.colormaps["YlOrRd"]); cm_smooth.set_bad(NAN_COLOR)
+
+    n_rows, n_cols = 3, len(kernel_sizes)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(22, 13))
+    fig.subplots_adjust(hspace=0.08, wspace=0.06,
+                        left=0.12, right=0.97, top=0.93, bottom=0.08)
+
+    im_smooth_ref = None
+    for c, (k, closed) in enumerate(zip(kernel_sizes, closed_results)):
+        ax0, ax1, ax2 = axes[0][c], axes[1][c], axes[2][c]
+
+        # Row 0 — smoothed probability (identical for all cols)
+        im_sm = ax0.imshow(np.ma.masked_invalid(smooth_display),
+                           cmap=cm_smooth, origin="upper", vmin=0.0, vmax=1.0)
+        ax0.set_xticks([]); ax0.set_yticks([])
+        ax0.set_title(f"kernel  {k}×{k}", fontsize=FS_TITLE, pad=6)
+
+        # Row 1 — binary after threshold (identical for all cols)
+        ax1.imshow(binary_lbl, cmap=cmap_lab, norm=norm_lab, origin="upper")
+        ax1.set_xticks([]); ax1.set_yticks([])
+
+        # Row 2 — after closing with this kernel
+        ax2.imshow(closed, cmap=cmap_lab, norm=norm_lab, origin="upper")
+        ax2.set_xticks([]); ax2.set_yticks([])
+        _sw_contour(ax2, labels_ref)
+
+        # Orange border on chosen column
+        if c == chosen_idx:
+            im_smooth_ref = im_sm
+            for r in range(n_rows):
+                for sp in axes[r][c].spines.values():
+                    sp.set_edgecolor(HIGHLIGHT_COLOR); sp.set_linewidth(3)
+
+    axes[0][0].set_ylabel(f"Smoothed probability\n(σ = {SWD_CLEAN_SIGMA} px)",
+                          fontsize=FS - 1, labelpad=8)
+    axes[1][0].set_ylabel(f"After threshold  t = {SWD_CLEAN_THRESH}",
+                          fontsize=FS - 1, labelpad=8)
+    axes[2][0].set_ylabel(f"After closing\n({SWD_CLOSING_ITER} iterations)",
+                          fontsize=FS - 1, labelpad=8)
+
+    # Legends
+    leg_lab = [Patch(facecolor="white",   edgecolor="#aaaaaa", label="flat seabed"),
+               Patch(facecolor="#e53935", label="sandwave"),
+               Patch(facecolor=NAN_COLOR, label="no data"),
+               Line2D([0], [0], color=SW_CONTOUR_COLOR, lw=1.5,
+                      label="chosen full-pipeline result")]
+    axes[2][-1].legend(handles=leg_lab, fontsize=FS - 3, loc="lower right",
+                       framealpha=0.85, edgecolor="#aaaaaa")
+
+    # Colorbar for row 0 (probability), with threshold line
+    fig.canvas.draw()
+    cbar_y, cbar_h = 0.028, 0.020
+    pos0  = axes[0][0].get_position()
+    pos0e = axes[0][-1].get_position()
+    cax   = fig.add_axes([pos0.x0, cbar_y, pos0e.x1 - pos0.x0, cbar_h])
+    cb    = fig.colorbar(im_smooth_ref, cax=cax, orientation="horizontal")
+    cb.set_label("Smoothed probability", fontsize=FS - 1)
+    cb.ax.tick_params(labelsize=FS - 3)
+    cb.ax.axvline(x=SWD_CLEAN_THRESH, color="#1565c0", lw=2.0)
+    cb.ax.text(SWD_CLEAN_THRESH + 0.015, 0.5,
+               f"t = {SWD_CLEAN_THRESH}",
+               ha="left", va="center", fontsize=FS - 4, color="#1565c0",
+               transform=cb.ax.get_yaxis_transform())
+
+    fig.suptitle(
+        f"Binary closing kernel size — pipeline context: smoothed → threshold → close  "
+        f"(chosen: 3×3, {SWD_CLOSING_ITER} iterations)",
+        fontsize=FS_TITLE + 1, fontweight="bold", y=0.97)
+
+    _save_or_show(fig, save_path)
+
+
+# ---------------------------------------------------------------------------
+# Figure 21 — Erosion component of binary closing (cell 14)
+# ---------------------------------------------------------------------------
+
+def plot_swd_erosion_effect(save_path=None):
+    """
+    Decompose binary_closing = dilation → erosion to make the erosion step visible.
+    Uses cell 14 where thin sandwave features are visibly eroded back.
+
+    Layout: 3 rows × 4 columns  (iterations: 1, 2, 5, 10)
+      Row 0  After binary *dilation* only  (no erosion yet).
+      Row 1  After binary *closing*  (= dilation then erosion).
+      Row 2  Erosion effect — pixels removed by erosion highlighted in blue.
+             (blue = dilated but NOT in closing result)
+
+    Orange border = chosen iteration count (iter = 2).
+    """
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+
+    print("  Loading sandwave labels (cell 47) …", flush=True)
+    _, _, nan_mask = _load_swd()
+    valid_mask   = ~nan_mask
+    labels_raw   = _load_swd_raw_labels()
+    labels_ref   = _load_swd_labels()
+    labels_bin   = np.where(labels_raw < 0, 0, labels_raw)
+
+    # Compute smoothed probability + threshold (same params as chosen pipeline)
+    labels_f = labels_bin.astype(np.float32)
+    valid_f  = valid_mask.astype(np.float32)
+    weighted = ndimage.gaussian_filter(labels_f * valid_f,
+                                       sigma=SWD_CLEAN_SIGMA, mode="nearest")
+    support  = ndimage.gaussian_filter(valid_f, sigma=SWD_CLEAN_SIGMA, mode="nearest")
+    smooth_f = np.divide(weighted, support,
+                         out=np.zeros_like(weighted, dtype=np.float32),
+                         where=support > 1e-6)
+    binary_input = (smooth_f > SWD_CLEAN_THRESH) & valid_mask
+
+    struct = np.ones((3, 3), dtype=bool)
+    iters  = [1, 2, 5, 10]
+    chosen_col = iters.index(SWD_CLOSING_ITER)  # iter=2 → col 1
+
+    # 4-class colormap for Row 2:  -1=gray, 0=white, 1=red(kept), 2=blue(eroded)
+    cmap4 = ListedColormap(["#cccccc", "white", "#e53935", "#1565c0"])
+    norm4 = BoundaryNorm([-1.5, -0.5, 0.5, 1.5, 2.5], 4)
+
+    cmap_lab, norm_lab = _labels_cmap_norm()
+
+    n_rows, n_cols = 3, len(iters)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 13))
+    fig.subplots_adjust(hspace=0.08, wspace=0.06,
+                        left=0.14, right=0.97, top=0.93, bottom=0.06)
+
+    for c, n_iter in enumerate(iters):
+        dilated = ndimage.binary_dilation(binary_input, structure=struct,
+                                          iterations=n_iter)
+        closed  = ndimage.binary_erosion(dilated, structure=struct,
+                                         iterations=n_iter, border_value=1)
+        eroded_away = dilated & ~closed   # added by dilation, removed by erosion
+
+        def _lbl(mask):
+            out = np.zeros(binary_input.shape, dtype=np.int8)
+            out[mask] = 1; out[~valid_mask] = -1
+            return out
+
+        # Row 2 combined: 0=flat, 1=kept sandwave, 2=eroded away, -1=nodata
+        diff_img = np.where(~valid_mask, -1,
+                   np.where(closed,      1,
+                   np.where(eroded_away, 2, 0))).astype(np.int8)
+
+        ax0, ax1, ax2 = axes[0][c], axes[1][c], axes[2][c]
+
+        ax0.imshow(_lbl(dilated), cmap=cmap_lab, norm=norm_lab, origin="upper")
+        ax1.imshow(_lbl(closed),  cmap=cmap_lab, norm=norm_lab, origin="upper")
+        ax2.imshow(diff_img,      cmap=cmap4,    norm=norm4,    origin="upper")
+
+        for ax in (ax0, ax1, ax2):
+            ax.set_xticks([]); ax.set_yticks([])
+            _sw_contour(ax, labels_ref)
+
+        axes[0][c].set_title(f"{n_iter} iter{'s' if n_iter > 1 else ''}",
+                             fontsize=FS_TITLE, pad=6)
+
+        if c == chosen_col:
+            for r in range(n_rows):
+                for sp in axes[r][c].spines.values():
+                    sp.set_edgecolor(HIGHLIGHT_COLOR); sp.set_linewidth(3)
+
+    axes[0][0].set_ylabel("After dilation only", fontsize=FS, labelpad=8)
+    axes[1][0].set_ylabel("After closing\n(dilation + erosion)", fontsize=FS, labelpad=8)
+    axes[2][0].set_ylabel("Erosion effect\n(blue = removed by erosion)", fontsize=FS, labelpad=8)
+
+    # Legends
+    leg_lab = [Patch(facecolor="white",   edgecolor="#aaaaaa", label="flat seabed"),
+               Patch(facecolor="#e53935", label="sandwave (kept)"),
+               Patch(facecolor=NAN_COLOR, label="no data"),
+               Line2D([0], [0], color=SW_CONTOUR_COLOR, lw=1.5,
+                      label="chosen full-pipeline boundary")]
+    axes[0][-1].legend(handles=leg_lab, fontsize=FS - 3, loc="lower right",
+                       framealpha=0.85, edgecolor="#aaaaaa")
+
+    leg_ero = [Patch(facecolor="#e53935", label="sandwave (survived erosion)"),
+               Patch(facecolor="#1565c0", label="removed by erosion"),
+               Patch(facecolor="white",   edgecolor="#aaaaaa", label="flat seabed"),
+               Patch(facecolor=NAN_COLOR, label="no data")]
+    axes[2][-1].legend(handles=leg_ero, fontsize=FS - 3, loc="lower right",
+                       framealpha=0.85, edgecolor="#aaaaaa")
+
+    fig.suptitle(
+        f"Erosion component of binary closing — "
+        f"cell {SWD_CELL}, CDI {SWD_CDI}  "
+        f"(3×3 kernel, border_value=1)",
+        fontsize=FS_TITLE + 1, fontweight="bold", y=0.97)
+
+    _save_or_show(fig, save_path)
+
+
+# ---------------------------------------------------------------------------
+# Figure 16 — Sandwave detection: data overview
+# ---------------------------------------------------------------------------
+
+def plot_swd_data_overview(save_path=None):
+    """
+    Two-panel overview of the sandwave detection example raster.
+
+    Left   Destriped bathymetry (cmocean.deep) with NaN areas in gray and a 1 km scale bar.
+    Right  Same bathymetry with sandwave classification overlaid:
+             semi-transparent red fill = detected sandwave area;
+             green contour = boundary of smoothed labels.
+    """
+    from matplotlib.patches import Patch
+
+    print("  Loading sandwave raster …", flush=True)
+    filled, mean_val, nan_mask = _load_swd()
+    labels = _load_swd_labels()
+
+    raster = filled + mean_val   # absolute depth (m)
+    h, w   = raster.shape
+
+    vmin = float(np.nanmin(raster[~nan_mask]))
+    vmax = float(np.nanmax(raster[~nan_mask]))
+
+    cm_bath = copy.copy(CMAP_BATH); cm_bath.set_bad(NAN_COLOR)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6.5))
+    fig.subplots_adjust(wspace=0.06, left=0.04, right=0.94, top=0.89, bottom=0.12)
+
+    bath_masked = np.ma.masked_where(nan_mask, raster)
+
+    # ---- Left panel: bathymetry only ----------------------------------------
+    im = axes[0].imshow(bath_masked, cmap=cm_bath, origin="upper", vmin=vmin, vmax=vmax)
+    axes[0].set_title("Destriped bathymetry", fontsize=FS_TITLE, pad=7)
+    axes[0].set_xticks([]); axes[0].set_yticks([])
+
+    # 1 km scale bar (bottom-left corner)
+    scale_px = 1000 / 20   # 1 km at 20 m/px
+    sx0 = w * 0.05
+    sy  = h * 0.93
+    axes[0].plot([sx0, sx0 + scale_px], [sy, sy],
+                 "-", color="white", lw=3, solid_capstyle="butt")
+    axes[0].text(sx0 + scale_px / 2, sy + h * 0.025,
+                 "1 km", color="white", ha="center", va="top",
+                 fontsize=FS - 2, fontweight="bold")
+
+    # ---- Right panel: bathymetry + classification overlay -------------------
+    axes[1].imshow(bath_masked, cmap=cm_bath, origin="upper", vmin=vmin, vmax=vmax)
+
+    # Semi-transparent red fill over sandwave pixels
+    sw_fill = np.where(labels == 1, 1.0, np.nan)
+    axes[1].imshow(np.ma.masked_invalid(sw_fill),
+                   cmap="Reds", origin="upper", alpha=0.45, vmin=0, vmax=1)
+    _sw_contour(axes[1], labels)
+
+    axes[1].set_title("Sandwave classification overlay", fontsize=FS_TITLE, pad=7)
+    axes[1].set_xticks([]); axes[1].set_yticks([])
+
+    # Legend for right panel
+    leg = [Patch(facecolor="#e53935", alpha=0.55, label="sandwave area"),
+           Patch(facecolor=NAN_COLOR, label="no data")]
+    axes[1].legend(handles=leg, fontsize=FS - 2, loc="lower right",
+                   framealpha=0.85, edgecolor="#aaaaaa")
+
+    # Shared colorbar (spans both panels)
+    fig.canvas.draw()
+    pos0  = axes[0].get_position()
+    pos1  = axes[1].get_position()
+    cax   = fig.add_axes([pos0.x0, 0.045, pos1.x1 - pos0.x0, 0.025])
+    cb    = fig.colorbar(im, cax=cax, orientation="horizontal")
+    cb.set_label("Depth (m)", fontsize=FS - 1)
+    cb.ax.tick_params(labelsize=FS - 3)
+
+    fig.suptitle(
+        f"Example raster — cell {SWD_CELL}, CDI {SWD_CDI}  "
+        f"({w * 20 / 1000:.0f} × {h * 20 / 1000:.0f} km,  20 m/px)",
+        fontsize=FS_TITLE + 1, fontweight="bold", y=0.97)
+
+    _save_or_show(fig, save_path)
+
+
+# ---------------------------------------------------------------------------
+# Figure 17 — Label cleaning pipeline: step-by-step stages
+# ---------------------------------------------------------------------------
+
+def plot_swd_label_pipeline(save_path=None):
+    """
+    Six-panel step-by-step illustration of clean_smoothed_labels at chosen params.
+
+    Panels (left → right):
+      1 Raw K-Means labels
+      2 Gaussian-smoothed probability map  (σ = 20 px)
+      3 After threshold  t = 0.35
+      4 After binary closing  (2 iter, 3×3)
+      5 After fill_holes
+      6 After removing small islands  (< 200 px)
+
+    The threshold value is marked as a vertical line on the smoothed-map colorbar.
+    """
+    from matplotlib.patches import Patch
+
+    print("  Loading sandwave labels …", flush=True)
+    _, _, nan_mask = _load_swd()
+    valid_mask  = ~nan_mask
+    labels_raw  = _load_swd_raw_labels()
+    labels_bin  = np.where(labels_raw < 0, 0, labels_raw)
+
+    steps = _clean_steps(labels_bin, valid_mask,
+                         sigma=SWD_CLEAN_SIGMA, threshold=SWD_CLEAN_THRESH,
+                         closing_iter=SWD_CLOSING_ITER, min_pixels=SWD_MIN_PIXELS)
+
+    cmap_lab, norm_lab = _labels_cmap_norm()
+    cm_smooth = copy.copy(plt.colormaps["YlOrRd"]); cm_smooth.set_bad(NAN_COLOR)
+
+    panels = [
+        ("Raw K-Means labels",
+         labels_raw,
+         cmap_lab, norm_lab, None, None),
+        (f"Gaussian smoothing\n(σ = {SWD_CLEAN_SIGMA} px)",
+         steps["smoothed_float"],
+         cm_smooth, None, 0.0, 1.0),
+        (f"Threshold  t = {SWD_CLEAN_THRESH}",
+         steps["after_threshold"],
+         cmap_lab, norm_lab, None, None),
+        (f"Binary closing\n({SWD_CLOSING_ITER} iter, 3×3)",
+         steps["after_closing"],
+         cmap_lab, norm_lab, None, None),
+        ("Fill holes",
+         steps["after_fillholes"],
+         cmap_lab, norm_lab, None, None),
+        (f"Remove small islands\n(< {SWD_MIN_PIXELS} px)",
+         steps["final"],
+         cmap_lab, norm_lab, None, None),
+    ]
+
+    fig, axes = plt.subplots(1, 6, figsize=(22, 5))
+    fig.subplots_adjust(wspace=0.05, left=0.02, right=0.97, top=0.84, bottom=0.17)
+
+    im_smooth = None
+    for c, (title, data, cmap, norm, vmin, vmax) in enumerate(panels):
+        ax = axes[c]
+        if vmin is not None:
+            im = ax.imshow(np.ma.masked_invalid(data), cmap=cmap, origin="upper",
+                           vmin=vmin, vmax=vmax)
+            im_smooth = im
+        else:
+            im = ax.imshow(data, cmap=cmap, norm=norm, origin="upper")
+        ax.set_title(title, fontsize=FS_TITLE, pad=6)
+        ax.set_xticks([]); ax.set_yticks([])
+
+    # Arrows between panels
+    for c in range(5):
+        axes[c].annotate("", xy=(1.04, 0.5), xycoords="axes fraction",
+                         xytext=(1.0,  0.5), textcoords="axes fraction",
+                         arrowprops=dict(arrowstyle="->", color="#555555", lw=1.5))
+
+    # Colorbar below the smoothed panel, with threshold marker
+    fig.canvas.draw()
+    pos1 = axes[1].get_position()
+    cax  = fig.add_axes([pos1.x0, 0.055, pos1.width, 0.025])
+    cb   = fig.colorbar(im_smooth, cax=cax, orientation="horizontal")
+    cb.set_label("Smoothed probability", fontsize=FS - 2)
+    cb.ax.tick_params(labelsize=FS - 3)
+    cb.ax.axvline(x=SWD_CLEAN_THRESH, color="#1565c0", lw=2.0)
+    cb.ax.text(SWD_CLEAN_THRESH + 0.03, 0.5,
+               f"t = {SWD_CLEAN_THRESH}",
+               ha="left", va="center", fontsize=FS - 4, color="#1565c0",
+               transform=cb.ax.get_yaxis_transform())
+
+    # Legend
+    leg = [Patch(facecolor="white",   edgecolor="#aaaaaa", label="flat seabed (0)"),
+           Patch(facecolor="#e53935", label="sandwave (1)"),
+           Patch(facecolor=NAN_COLOR, label="no data (−1)")]
+    axes[-1].legend(handles=leg, fontsize=FS - 3, loc="lower right",
+                    framealpha=0.85, edgecolor="#aaaaaa")
+
+    fig.suptitle(
+        "Label cleaning pipeline: raw K-Means → smoothed binary classification",
+        fontsize=FS_TITLE + 1, fontweight="bold", y=0.97)
+
+    _save_or_show(fig, save_path)
+
+
+# ---------------------------------------------------------------------------
+# Figure 17 — Label cleaning: Gaussian smoothing sigma comparison
+# ---------------------------------------------------------------------------
+
+def plot_swd_sigma_comparison(save_path=None):
+    """
+    Justify the Gaussian smoothing sigma = 20 px for label cleanup.
+
+    Layout: 2 rows × 5 columns  (σ = 3, 7, 10, 20, 40 px)
+      Row 0  Continuous probability map (0–1) after Gaussian smoothing.
+             Threshold line shown on the shared colorbar.
+      Row 1  Final binary labels after the full cleaning pipeline.
+             Green contour = boundary produced by the chosen σ = 20.
+
+    Small σ → probability map noisy, fragmented sandwave patches.
+    Large σ → probability map over-smooth, sandwave regions bloat and merge.
+    """
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
+
+    print("  Loading sandwave labels …", flush=True)
+    _, _, nan_mask = _load_swd()
+    valid_mask  = ~nan_mask
+    labels_raw  = _load_swd_raw_labels()
+    labels_bin  = np.where(labels_raw < 0, 0, labels_raw)
+    labels_ref  = _load_swd_labels()   # chosen result for contour overlay
+
+    sigmas     = [3, 7, 10, 20, 40]
+    chosen_idx = sigmas.index(SWD_CLEAN_SIGMA)
+
+    all_smooth, all_final = [], []
+    for s in sigmas:
+        st = _clean_steps(labels_bin, valid_mask,
+                          sigma=s, threshold=SWD_CLEAN_THRESH,
+                          closing_iter=SWD_CLOSING_ITER, min_pixels=SWD_MIN_PIXELS)
+        all_smooth.append(st["smoothed_float"])
+        all_final.append(st["final"])
+
+    cmap_lab, norm_lab = _labels_cmap_norm()
+    cm_smooth = copy.copy(plt.colormaps["YlOrRd"]); cm_smooth.set_bad(NAN_COLOR)
+
+    n_rows, n_cols = 2, len(sigmas)
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(22, 9))
+    fig.subplots_adjust(hspace=0.08, wspace=0.06,
+                        left=0.09, right=0.97, top=0.88, bottom=0.13)
+
+    im_smooth_ref = None
+    for c, (s, sm, fin) in enumerate(zip(sigmas, all_smooth, all_final)):
+        ax0, ax1 = axes[0][c], axes[1][c]
+
+        # Row 0 — continuous probability map
+        im_sm = ax0.imshow(np.ma.masked_invalid(sm), cmap=cm_smooth,
+                           origin="upper", vmin=0.0, vmax=1.0)
+        ax0.set_xticks([]); ax0.set_yticks([])
+        ax0.set_title(f"σ = {s} px  ({s * 20} m)", fontsize=FS_TITLE, pad=6)
+        if c == 0:
+            ax0.set_ylabel("Smoothed probability", fontsize=FS, labelpad=8)
+
+        # Row 1 — final binary labels
+        ax1.imshow(fin, cmap=cmap_lab, norm=norm_lab, origin="upper")
+        ax1.set_xticks([]); ax1.set_yticks([])
+        _sw_contour(ax1, labels_ref)
+        if c == 0:
+            ax1.set_ylabel("Final binary labels", fontsize=FS, labelpad=8)
+
+        # Orange border for chosen column
+        if c == chosen_idx:
+            im_smooth_ref = im_sm
+            for r in range(n_rows):
+                for sp in axes[r][c].spines.values():
+                    sp.set_edgecolor(HIGHLIGHT_COLOR); sp.set_linewidth(3)
+
+    # Legends
+    from matplotlib.patches import Patch
+    leg_lab = [Patch(facecolor="white",   edgecolor="#aaaaaa", label="flat seabed"),
+               Patch(facecolor="#e53935", label="sandwave"),
+               Patch(facecolor=NAN_COLOR, label="no data")]
+    axes[1][0].legend(handles=leg_lab, fontsize=FS - 3, loc="lower left",
+                      framealpha=0.85, edgecolor="#aaaaaa")
+
+    leg_cnt = [plt.matplotlib.lines.Line2D(
+        [0], [0], color=SW_CONTOUR_COLOR, lw=1.5,
+        label=f"chosen boundary  (σ = {SWD_CLEAN_SIGMA} px)")]
+    axes[1][-1].legend(handles=leg_cnt, fontsize=FS - 3, loc="lower right",
+                       framealpha=0.85, edgecolor="#aaaaaa")
+
+    # Colorbar below row 0 (probability); mark threshold
+    fig.canvas.draw()
+    cbar_y, cbar_h = 0.042, 0.022
+    pos0  = axes[0][0].get_position()
+    pos0e = axes[0][-1].get_position()
+    full_w = pos0e.x1 - pos0.x0
+
+    cax = fig.add_axes([pos0.x0, cbar_y, full_w, cbar_h])
+    cb  = fig.colorbar(im_smooth_ref, cax=cax, orientation="horizontal")
+    cb.set_label("Smoothed probability", fontsize=FS - 1)
+    cb.ax.tick_params(labelsize=FS - 3)
+    cb.ax.axvline(x=SWD_CLEAN_THRESH, color="#1565c0", lw=2.0)
+    cb.ax.text(SWD_CLEAN_THRESH + 0.015, 0.5,
+               f"t = {SWD_CLEAN_THRESH}",
+               ha="left", va="center", fontsize=FS - 4, color="#1565c0",
+               transform=cb.ax.get_yaxis_transform())
+
+    fig.suptitle(
+        f"Gaussian smoothing sigma — label cleaning  "
+        f"(chosen: σ = {SWD_CLEAN_SIGMA} px = {SWD_CLEAN_SIGMA * 20} m)",
+        fontsize=FS_TITLE + 1, fontweight="bold", y=0.96)
+
+    _save_or_show(fig, save_path)
+
+
+# ---------------------------------------------------------------------------
+# Figure 18 — Label cleaning: threshold, closing, and min-size comparisons
+# ---------------------------------------------------------------------------
+
+def plot_swd_threshold_morphology(save_path=None):
+    """
+    Justify threshold = 0.35, closing_iter = 2, and min_cluster_pixels = 200.
+
+    Layout: 3 rows × 5 columns — each row varies one parameter, others fixed.
+      Row 0  Threshold     [0.05, 0.15, 0.35, 0.50, 0.70]
+      Row 1  Closing iter  [0, 1, 2, 5, 10]
+      Row 2  Min size (px) [0, 50, 100, 200, 500]
+
+    Each cell shows the *final* binary labels for that parameter combination.
+    Green contour = reference boundary (all params at chosen values).
+    Orange border = chosen value per row.
+
+    Row 0 story: low t → too much area; high t → sandwaves missed.
+    Row 1 story: 0 iter → fragmented patches with gaps; high iter → regions merge.
+    Row 2 story: 0 px → many noise islands; large min → real patches removed.
+    """
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
+
+    print("  Loading sandwave labels …", flush=True)
+    _, _, nan_mask = _load_swd()
+    valid_mask  = ~nan_mask
+    labels_raw  = _load_swd_raw_labels()
+    labels_bin  = np.where(labels_raw < 0, 0, labels_raw)
+    labels_ref  = _load_swd_labels()
+
+    thresh_vals = [0.05, 0.15, 0.35, 0.50, 0.70]
+    close_vals  = [0, 1, 2, 5, 10]
+    minpx_vals  = [0, 50, 100, 200, 500]
+
+    chosen_cols = [
+        thresh_vals.index(SWD_CLEAN_THRESH),   # row 0
+        close_vals.index(SWD_CLOSING_ITER),    # row 1
+        minpx_vals.index(SWD_MIN_PIXELS),      # row 2
+    ]
+
+    # Pre-compute final labels for each row
+    rows_data = [
+        [_clean_steps(labels_bin, valid_mask,
+                      sigma=SWD_CLEAN_SIGMA, threshold=t,
+                      closing_iter=SWD_CLOSING_ITER, min_pixels=SWD_MIN_PIXELS)["final"]
+         for t in thresh_vals],
+        [_clean_steps(labels_bin, valid_mask,
+                      sigma=SWD_CLEAN_SIGMA, threshold=SWD_CLEAN_THRESH,
+                      closing_iter=ci, min_pixels=SWD_MIN_PIXELS)["final"]
+         for ci in close_vals],
+        [_clean_steps(labels_bin, valid_mask,
+                      sigma=SWD_CLEAN_SIGMA, threshold=SWD_CLEAN_THRESH,
+                      closing_iter=SWD_CLOSING_ITER, min_pixels=mp)["final"]
+         for mp in minpx_vals],
+    ]
+    rows_vals = [thresh_vals, close_vals, minpx_vals]
+    rows_labels = [
+        [f"t = {v}" for v in thresh_vals],
+        [f"{v} iter" for v in close_vals],
+        [f"{v} px"   for v in minpx_vals],
+    ]
+    rows_ylabel = [
+        f"Threshold  t\n(σ={SWD_CLEAN_SIGMA}, close={SWD_CLOSING_ITER}, min={SWD_MIN_PIXELS} px)",
+        f"Closing iterations\n(σ={SWD_CLEAN_SIGMA}, t={SWD_CLEAN_THRESH}, min={SWD_MIN_PIXELS} px)",
+        f"Min island size (px)\n(σ={SWD_CLEAN_SIGMA}, t={SWD_CLEAN_THRESH}, close={SWD_CLOSING_ITER})",
+    ]
+
+    cmap_lab, norm_lab = _labels_cmap_norm()
+
+    n_rows, n_cols = 3, 5
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(22, 13))
+    fig.subplots_adjust(hspace=0.10, wspace=0.06,
+                        left=0.14, right=0.97, top=0.94, bottom=0.06)
+
+    for r, (data_row, val_row, lbl_row, chosen_c, ylabel) in enumerate(
+            zip(rows_data, rows_vals, rows_labels, chosen_cols, rows_ylabel)):
+        for c, (data, lbl) in enumerate(zip(data_row, lbl_row)):
+            ax = axes[r][c]
+            ax.imshow(data, cmap=cmap_lab, norm=norm_lab, origin="upper")
+            ax.set_xticks([]); ax.set_yticks([])
+            _sw_contour(ax, labels_ref)
+
+            # Per-panel parameter value (top centre)
+            ax.text(0.5, 0.97, lbl,
+                    transform=ax.transAxes, ha="center", va="top",
+                    fontsize=FS - 2,
+                    bbox=dict(boxstyle="round,pad=0.25", facecolor="white",
+                              alpha=0.85, edgecolor="none"))
+
+            # Orange border for chosen column in this row
+            if c == chosen_c:
+                for sp in ax.spines.values():
+                    sp.set_edgecolor(HIGHLIGHT_COLOR); sp.set_linewidth(3)
+
+        axes[r][0].set_ylabel(ylabel, fontsize=FS - 1, labelpad=8)
+
+    # Shared legend (top-right of last panel in first row)
+    leg = [Patch(facecolor="white",   edgecolor="#aaaaaa", label="flat seabed"),
+           Patch(facecolor="#e53935", label="sandwave"),
+           Patch(facecolor=NAN_COLOR, label="no data"),
+           Line2D([0], [0], color=SW_CONTOUR_COLOR, lw=1.5,
+                  label="chosen result boundary")]
+    axes[0][-1].legend(handles=leg, fontsize=FS - 3, loc="lower right",
+                       framealpha=0.85, edgecolor="#aaaaaa")
+
+    fig.suptitle(
+        f"Label post-processing: threshold / closing / min island size  "
+        f"(chosen: t={SWD_CLEAN_THRESH}, close={SWD_CLOSING_ITER}, min={SWD_MIN_PIXELS} px)",
+        fontsize=FS_TITLE + 1, fontweight="bold", y=0.97)
+
+    _save_or_show(fig, save_path)
+
+
+# ---------------------------------------------------------------------------
+# Figure 22 — Study-area coverage + sandwave detections overview
+# ---------------------------------------------------------------------------
+
+def plot_coverage_and_sandwaves(save_path=None):
+    """
+    Single-panel overview of the full study area.
+
+    Base layer  : combined destriped bathymetry (cmocean.deep), NaN cells in gray.
+    Overlay     : sandwave probability as a semi-transparent red tint —
+                  prob = 0 → fully transparent; prob = 1 → solid red (alpha 0.75).
+                  The probability per 100 m cell is the mean fraction of surveys
+                  that detected a sandwave there (after 5× max-pool downscale).
+    Routes      : Route 1 and Route 2 from shapefiles, drawn as solid lines.
+    """
+    import skimage as ski
+    import costmap as cm_mod
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
+
+    LABELS_DIR  = "sandwave_detection_v8/labels"
+    MAX_ALPHA   = 0.75   # alpha when sandwave probability = 1.0
+
+    def _stack_mean(rasters):
+        stacked = np.stack(rasters, axis=0)
+        with np.errstate(invalid="ignore"):
+            return np.nanmean(stacked, axis=0)
+
+    # ---- Build bathymetry base map ------------------------------------------
+    print("  Building bathymetry base map …", flush=True)
+    bath = cm_mod.CostMap(dx=100, dy=100, default_cost=np.nan)
+    raster_dict: dict = {}
+    for fname in os.listdir("destriped_rasters"):
+        cid = fname.split("_")[1]
+        arr = np.load(os.path.join("destriped_rasters", fname))[::-1, :]
+        raster_dict.setdefault(cid, []).append(arr)
+    for cid, rasters in raster_dict.items():
+        avg      = _stack_mean(rasters)
+        rescaled = ski.measure.block_reduce(avg, block_size=5, func=np.nanmean)
+        xs, xe, ys, ye = bath.slice_cost_map(int(cid))
+        bath.add_cost(xs, ys, cost=rescaled, x_idx_end=xe, y_idx_end=ye)
+
+    # ---- Build sandwave probability map -------------------------------------
+    print("  Building sandwave probability map …", flush=True)
+    sw = cm_mod.CostMap(dx=100, dy=100, default_cost=np.nan)
+    sw_dict: dict = {}
+    for fname in [f for f in os.listdir(LABELS_DIR)
+                  if f.endswith("destriped_labels_smoothed.npy")]:
+        cid = fname.split("_")[1]
+        arr = np.load(os.path.join(LABELS_DIR, fname))[::-1, :].astype(float)
+        arr[arr == -1] = np.nan
+        sw_dict.setdefault(cid, []).append(arr)
+    for cid, rasters in sw_dict.items():
+        avg      = _stack_mean(rasters)
+        rescaled = ski.measure.block_reduce(avg, block_size=5, func=np.max)
+        xs, xe, ys, ye = sw.slice_cost_map(int(cid))
+        sw.add_cost(xs, ys, cost=rescaled, x_idx_end=xe, y_idx_end=ye)
+
+    # ---- RGBA overlay: red with per-pixel alpha = probability ---------------
+    sw_prob = np.where(np.isnan(sw.costs), 0.0, sw.costs)  # NaN → transparent
+    sw_prob = np.clip(sw_prob, 0.0, 1.0)
+    rgba_overlay        = np.zeros((*sw_prob.shape, 4), dtype=float)
+    rgba_overlay[..., 0] = 0.84   # R  (matches #d62728)
+    rgba_overlay[..., 1] = 0.15   # G
+    rgba_overlay[..., 2] = 0.16   # B
+    rgba_overlay[..., 3] = sw_prob * MAX_ALPHA
+
+    # ---- Load routes via geopandas for smooth vector lines ------------------
+    try:
+        import geopandas as gpd
+        USE_VECTOR_ROUTES = True
+    except ImportError:
+        USE_VECTOR_ROUTES = False
+
+    # ---- Extent in UTM 31N --------------------------------------------------
+    bl      = bath.bl          # (555652, 5910512)
+    nx, ny  = 80_000, 35_000   # metres
+    extent  = [bl[0], bl[0] + nx, bl[1], bl[1] + ny]
+
+    # ---- Figure -------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(16, 7.5))
+    fig.subplots_adjust(left=0.07, right=0.97, top=0.91, bottom=0.13)
+
+    # Base: bathymetry
+    bath_masked = np.ma.masked_invalid(bath.costs)
+    cm_bath2 = copy.copy(CMAP_BATH)
+    cm_bath2.set_bad(NAN_COLOR)
+    im = ax.imshow(
+        bath_masked,
+        cmap=cm_bath2,
+        origin="lower", extent=extent,
+        interpolation="nearest",
+        aspect="equal",
+        zorder=1,
+    )
+
+    # Colorbar for bathymetry
+    cbar = fig.colorbar(im, ax=ax, fraction=0.025, pad=0.02, shrink=0.85)
+    cbar.set_label("Depth  [m]", fontsize=FS - 2)
+    cbar.ax.tick_params(labelsize=FS - 3)
+
+    # Sandwave overlay (RGBA, per-pixel alpha)
+    ax.imshow(
+        rgba_overlay,
+        origin="lower", extent=extent,
+        interpolation="nearest",
+        aspect="equal",
+        zorder=2,
+    )
+
+    # ---- Route lines --------------------------------------------------------
+    ROUTE_FILES  = ["shapes/line1.shp", "shapes/line2.shp"]
+    ROUTE_COLORS = ["#1f77b4", "#ff7f0e"]
+    ROUTE_LABELS = ["Route 1", "Route 2"]
+
+    if USE_VECTOR_ROUTES:
+        for fpath, color, label in zip(ROUTE_FILES, ROUTE_COLORS, ROUTE_LABELS):
+            if os.path.exists(fpath):
+                gdf = gpd.read_file(fpath).to_crs(bath.csr)
+                gdf.plot(ax=ax, color=color, linewidth=2.0,
+                         label=label, zorder=5)
+    else:
+        for route, color, label in zip(bath.routes, ROUTE_COLORS, ROUTE_LABELS):
+            ys_r, xs_r = np.where(route)
+            utm_x = bl[0] + xs_r * 100 + 50
+            utm_y = bl[1] + ys_r * 100 + 50
+            ax.scatter(utm_x, utm_y, c=color, s=2, zorder=5,
+                       label=label, linewidths=0)
+
+    # ---- Axes ---------------------------------------------------------------
+    ax.set_xlabel("Easting  [m, UTM 31N]", fontsize=FS)
+    ax.set_ylabel("Northing  [m, UTM 31N]", fontsize=FS)
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+    ax.locator_params(axis="x", nbins=6)
+    ax.locator_params(axis="y", nbins=6)
+    plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=FS - 2)
+    plt.setp(ax.get_yticklabels(), fontsize=FS - 2)
+    ax.set_title(
+        "Destriped bathymetry with sandwave detections",
+        fontsize=FS_TITLE + 1, fontweight="bold", pad=10,
+    )
+
+    # ---- Legend -------------------------------------------------------------
+    # Sandwave probability is shown via a gradient patch (3 alpha steps)
+    sw_legend_patches = [
+        Patch(facecolor=(0.84, 0.15, 0.16, a), edgecolor="none",
+              label=lbl)
+        for a, lbl in [
+            (MAX_ALPHA * 0.33, "Sandwave prob. < 33 %"),
+            (MAX_ALPHA * 0.67, "Sandwave prob. 33–67 %"),
+            (MAX_ALPHA * 1.00, "Sandwave prob. > 67 %"),
+        ]
+    ]
+    legend_handles = [
+        Patch(facecolor=NAN_COLOR, edgecolor="none", label="No survey data"),
+        *sw_legend_patches,
+        Line2D([0], [0], color=ROUTE_COLORS[0], lw=2, label=ROUTE_LABELS[0]),
+        Line2D([0], [0], color=ROUTE_COLORS[1], lw=2, label=ROUTE_LABELS[1]),
+    ]
+    ax.legend(handles=legend_handles, loc="upper left",
+              fontsize=FS - 2, frameon=True, edgecolor="#cccccc")
+
+    _save_or_show(fig, save_path)
+
+
+# ---------------------------------------------------------------------------
+# Figure 23 — Variance cost map + threshold justification
+# ---------------------------------------------------------------------------
+
+def plot_variance_costmap(save_path=None):
+    """
+    Two-row figure supporting the variance threshold choice (var_threshold = 0.05).
+
+    Row 0  Left  : Continuous log-variance map across the study area.
+    Row 0  Right : Histogram of log-variance values with all candidate threshold
+                   lines; chosen threshold (0.05) highlighted in orange.
+    Row 1         : Binary "high-variance" masks at five candidate thresholds;
+                    chosen panel has an orange border and fraction-flagged badge.
+    """
+    import skimage as ski
+    import costmap as cm_mod
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+
+    VAR_DIR    = "variance_rasters/Rasters"
+    CHOSEN     = 0.05
+    THRESHOLDS = [0.02, 0.035, 0.05, 0.08, 0.15]
+
+    # ---- Build log-variance map ---------------------------------------------
+    print("  Building variance map …", flush=True)
+    cmap_obj = cm_mod.CostMap(dx=100, dy=100, default_cost=np.nan)
+    d: dict = {}
+    for fname in os.listdir(VAR_DIR):
+        cid = fname.split("_")[1]
+        arr = np.load(os.path.join(VAR_DIR, fname))[::-1, :]
+        d.setdefault(cid, []).append(arr)
+    for cid, rasters in d.items():
+        with np.errstate(invalid="ignore"):
+            avg = np.nanmean(np.stack(rasters, axis=0), axis=0)
+        rescaled    = ski.measure.block_reduce(avg, block_size=5, func=np.nanmean)
+        transformed = np.log10(np.sqrt(np.maximum(rescaled, 0.0)) + 1.0)
+        xs, xe, ys, ye = cmap_obj.slice_cost_map(int(cid))
+        cmap_obj.add_cost(xs, ys, cost=transformed, x_idx_end=xe, y_idx_end=ye)
+
+    values   = cmap_obj.costs
+    has_data = ~np.isnan(values)
+    valid    = values[has_data]
+    bl       = cmap_obj.bl
+    extent   = [bl[0], bl[0] + 80_000, bl[1], bl[1] + 35_000]
+    vmax_map = float(np.nanpercentile(values, 99))
+
+    # ---- Layout (constrained_layout handles equal-aspect axes cleanly) ------
+    # 5 columns: map=4, histogram=1; bottom row 5 panels each 1 col → full width
+    fig = plt.figure(figsize=(18, 11), constrained_layout=True)
+    gs  = fig.add_gridspec(2, 5,
+                           height_ratios=[2.2, 1.6],
+                           hspace=0.12, wspace=0.15)
+    ax_map  = fig.add_subplot(gs[0, :4])
+    ax_hist = fig.add_subplot(gs[0,  4])
+    ax_t    = [fig.add_subplot(gs[1, i]) for i in range(5)]
+    ax_map.set_anchor("W")   # keep map left-aligned when aspect="equal" shrinks it
+
+    # ---- Continuous map -----------------------------------------------------
+    cm_var = copy.copy(plt.colormaps["YlOrRd"])
+    cm_var.set_bad(NAN_COLOR)
+    im = ax_map.imshow(
+        np.ma.masked_invalid(values),
+        cmap=cm_var, vmin=0, vmax=vmax_map,
+        origin="lower", extent=extent,
+        interpolation="nearest", aspect="equal",
+    )
+    cbar = fig.colorbar(im, ax=ax_map, shrink=0.9, pad=0.02)
+    cbar.set_label(r"$\log_{10}(\sqrt{\mathrm{var}}+1)$  [–]", fontsize=FS - 2)
+    cbar.ax.tick_params(labelsize=FS - 3)
+    cbar.ax.axhline(y=CHOSEN / vmax_map, color=HIGHLIGHT_COLOR, lw=2.0)
+    ax_map.set_xlabel("Easting  [m, UTM 31N]", fontsize=FS - 2)
+    ax_map.set_ylabel("Northing  [m, UTM 31N]", fontsize=FS - 2)
+    ax_map.locator_params(axis="x", nbins=5)
+    ax_map.locator_params(axis="y", nbins=5)
+    plt.setp(ax_map.get_xticklabels(), rotation=30, ha="right", fontsize=FS - 3)
+    plt.setp(ax_map.get_yticklabels(), fontsize=FS - 3)
+    ax_map.set_title(r"Continuous log-variance  $\log_{10}(\sqrt{\sigma^2}+1)$",
+                     fontsize=FS_TITLE, pad=6)
+
+    # ---- Histogram ----------------------------------------------------------
+    med_v = float(np.median(valid))
+    std_v = float(np.std(valid))
+
+    ax_hist.hist(valid, bins=60, color="#888888", edgecolor="none",
+                 density=True, orientation="vertical")
+    ax_hist.axvline(med_v, color="#333333", lw=1.2, ls=":", zorder=2,
+                    label=f"median")
+    for thresh in THRESHOLDS:
+        is_chosen = (thresh == CHOSEN)
+        nsig = (thresh - med_v) / std_v
+        ax_hist.axvline(thresh,
+                        color=HIGHLIGHT_COLOR if is_chosen else "#444444",
+                        lw=2.2 if is_chosen else 1.2,
+                        ls="-"  if is_chosen else "--",
+                        zorder=3 if is_chosen else 2,
+                        label=f"{thresh:.3f}  ({nsig:+.1f}σ)"
+                              + (" ✓" if is_chosen else ""))
+    # Secondary x-axis on top showing σ from median
+    ax_top = ax_hist.secondary_xaxis(
+        "top",
+        functions=(lambda x: (x - med_v) / std_v,
+                   lambda z: z * std_v + med_v),
+    )
+    ax_top.set_xlabel("σ from median", fontsize=FS - 4)
+    ax_top.tick_params(labelsize=FS - 4)
+    ax_hist.set_xlabel(r"$\log_{10}(\sqrt{\sigma^2}+1)$", fontsize=FS - 3)
+    ax_hist.set_ylabel("Density", fontsize=FS - 3)
+    ax_hist.set_title("Value distribution", fontsize=FS_TITLE - 1, pad=6)
+    ax_hist.legend(fontsize=FS - 4, title="Threshold  (σ from median)",
+                   title_fontsize=FS - 5, frameon=True)
+    ax_hist.tick_params(labelsize=FS - 3)
+
+    # ---- Threshold comparison panels ----------------------------------------
+    cmap_bin = ListedColormap([NAN_COLOR, "white", "#d62728"])
+    norm_bin = BoundaryNorm([-1.5, -0.5, 0.5, 1.5], 3)
+    for ax, thresh in zip(ax_t, THRESHOLDS):
+        binary                  = np.full_like(values, np.nan)
+        binary[has_data]        = np.where(values[has_data] > thresh, 1.0, 0.0)
+        ax.imshow(
+            np.ma.masked_invalid(binary),
+            cmap=cmap_bin, norm=norm_bin,
+            origin="lower", extent=extent,
+            interpolation="nearest",
+        )
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title(f"t = {thresh:.3f}", fontsize=FS_TITLE - 1, pad=4)
+        if thresh == CHOSEN:
+            for spine in ax.spines.values():
+                spine.set_edgecolor(HIGHLIGHT_COLOR)
+                spine.set_linewidth(3.5)
+        frac = float(np.mean(binary[has_data] == 1.0)) * 100
+        ax.text(0.97, 0.03, f"{frac:.1f} % flagged",
+                transform=ax.transAxes, ha="right", va="bottom",
+                fontsize=FS - 4,
+                bbox=dict(boxstyle="round,pad=0.25", facecolor="white",
+                          edgecolor="none", alpha=0.85))
+
+    fig.suptitle(
+        f"Variance-based dynamic-seabed cost map  —  chosen threshold = {CHOSEN}",
+        fontsize=FS_TITLE + 1, fontweight="bold",
+    )
+    _save_or_show(fig, save_path)
+
+
+# ---------------------------------------------------------------------------
+# Figure 24 — Amplitude cost map + threshold justification
+# ---------------------------------------------------------------------------
+
+def plot_amplitude_costmap(save_path=None):
+    """
+    Two-row figure supporting the amplitude threshold choice (amp_threshold = 0.08).
+
+    Row 0  Left  : Continuous sandwave-amplitude map across the study area.
+    Row 0  Right : Histogram of amplitude values with all candidate threshold
+                   lines; chosen threshold (0.08 m) highlighted in orange.
+    Row 1         : Binary "high-amplitude" masks at five candidate thresholds;
+                    chosen panel has an orange border and fraction-flagged badge.
+    """
+    import skimage as ski
+    import costmap as cm_mod
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+
+    AMP_DIR    = "amplitude_rasters/Rasters_amp"
+    CHOSEN     = 0.08
+    THRESHOLDS = [0.03, 0.05, 0.08, 0.12, 0.20]
+
+    # ---- Build amplitude map ------------------------------------------------
+    print("  Building amplitude map …", flush=True)
+    cmap_obj = cm_mod.CostMap(dx=100, dy=100, default_cost=np.nan)
+    d: dict = {}
+    for fname in os.listdir(AMP_DIR):
+        cid = fname.split("_")[1]
+        arr = np.load(os.path.join(AMP_DIR, fname))[::-1, :]
+        d.setdefault(cid, []).append(arr)
+    for cid, rasters in d.items():
+        with np.errstate(invalid="ignore"):
+            avg = np.nanmax(np.stack(rasters, axis=0), axis=0)
+        rescaled = ski.measure.block_reduce(avg, block_size=5, func=np.nanmax)
+        xs, xe, ys, ye = cmap_obj.slice_cost_map(int(cid))
+        cmap_obj.add_cost(xs, ys, cost=rescaled, x_idx_end=xe, y_idx_end=ye)
+
+    values   = cmap_obj.costs
+    has_data = ~np.isnan(values)
+    valid    = values[has_data]
+    bl       = cmap_obj.bl
+    extent   = [bl[0], bl[0] + 80_000, bl[1], bl[1] + 35_000]
+    vmax_map = float(np.nanpercentile(values, 99))
+
+    # ---- Layout (constrained_layout handles equal-aspect axes cleanly) ------
+    # 5 columns: map=4, histogram=1; bottom row 5 panels each 1 col → full width
+    fig = plt.figure(figsize=(18, 11), constrained_layout=True)
+    gs  = fig.add_gridspec(2, 5,
+                           height_ratios=[2.2, 1.6],
+                           hspace=0.12, wspace=0.15)
+    ax_map  = fig.add_subplot(gs[0, :4])
+    ax_hist = fig.add_subplot(gs[0,  4])
+    ax_t    = [fig.add_subplot(gs[1, i]) for i in range(5)]
+    ax_map.set_anchor("W")   # keep map left-aligned when aspect="equal" shrinks it
+
+    # ---- Continuous map -----------------------------------------------------
+    cm_amp = copy.copy(plt.colormaps["YlOrBr"])
+    cm_amp.set_bad(NAN_COLOR)
+    im = ax_map.imshow(
+        np.ma.masked_invalid(values),
+        cmap=cm_amp, vmin=0, vmax=vmax_map,
+        origin="lower", extent=extent,
+        interpolation="nearest", aspect="equal",
+    )
+    cbar = fig.colorbar(im, ax=ax_map, shrink=0.9, pad=0.02)
+    cbar.set_label("Sandwave amplitude  [m]", fontsize=FS - 2)
+    cbar.ax.tick_params(labelsize=FS - 3)
+    cbar.ax.axhline(y=CHOSEN / vmax_map, color=HIGHLIGHT_COLOR, lw=2.0)
+    ax_map.set_xlabel("Easting  [m, UTM 31N]", fontsize=FS - 2)
+    ax_map.set_ylabel("Northing  [m, UTM 31N]", fontsize=FS - 2)
+    ax_map.locator_params(axis="x", nbins=5)
+    ax_map.locator_params(axis="y", nbins=5)
+    plt.setp(ax_map.get_xticklabels(), rotation=30, ha="right", fontsize=FS - 3)
+    plt.setp(ax_map.get_yticklabels(), fontsize=FS - 3)
+    ax_map.set_title("Continuous sandwave-amplitude map  (max across surveys)",
+                     fontsize=FS_TITLE, pad=6)
+
+    # ---- Histogram ----------------------------------------------------------
+    med_v = float(np.median(valid))
+    std_v = float(np.std(valid))
+
+    ax_hist.hist(valid, bins=60, color="#888888", edgecolor="none",
+                 density=True, orientation="vertical")
+    ax_hist.axvline(med_v, color="#333333", lw=1.2, ls=":", zorder=2,
+                    label=f"median")
+    for thresh in THRESHOLDS:
+        is_chosen = (thresh == CHOSEN)
+        nsig = (thresh - med_v) / std_v
+        ax_hist.axvline(thresh,
+                        color=HIGHLIGHT_COLOR if is_chosen else "#444444",
+                        lw=2.2 if is_chosen else 1.2,
+                        ls="-"  if is_chosen else "--",
+                        zorder=3 if is_chosen else 2,
+                        label=f"{thresh:.2f} m  ({nsig:+.1f}σ)"
+                              + (" ✓" if is_chosen else ""))
+    # Secondary x-axis on top showing σ from median
+    ax_top = ax_hist.secondary_xaxis(
+        "top",
+        functions=(lambda x: (x - med_v) / std_v,
+                   lambda z: z * std_v + med_v),
+    )
+    ax_top.set_xlabel("σ from median", fontsize=FS - 4)
+    ax_top.tick_params(labelsize=FS - 4)
+    ax_hist.set_xlabel("Amplitude  [m]", fontsize=FS - 3)
+    ax_hist.set_ylabel("Density", fontsize=FS - 3)
+    ax_hist.set_title("Value distribution", fontsize=FS_TITLE - 1, pad=6)
+    ax_hist.legend(fontsize=FS - 4, title="Threshold  (σ from median)",
+                   title_fontsize=FS - 5, frameon=True)
+    ax_hist.tick_params(labelsize=FS - 3)
+
+    # ---- Threshold comparison panels ----------------------------------------
+    cmap_bin = ListedColormap([NAN_COLOR, "white", "#d62728"])
+    norm_bin = BoundaryNorm([-1.5, -0.5, 0.5, 1.5], 3)
+    for ax, thresh in zip(ax_t, THRESHOLDS):
+        binary                  = np.full_like(values, np.nan)
+        binary[has_data]        = np.where(values[has_data] > thresh, 1.0, 0.0)
+        ax.imshow(
+            np.ma.masked_invalid(binary),
+            cmap=cmap_bin, norm=norm_bin,
+            origin="lower", extent=extent,
+            interpolation="nearest",
+        )
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title(f"t = {thresh:.2f} m", fontsize=FS_TITLE - 1, pad=4)
+        if thresh == CHOSEN:
+            for spine in ax.spines.values():
+                spine.set_edgecolor(HIGHLIGHT_COLOR)
+                spine.set_linewidth(3.5)
+        frac = float(np.mean(binary[has_data] == 1.0)) * 100
+        ax.text(0.97, 0.03, f"{frac:.1f} % flagged",
+                transform=ax.transAxes, ha="right", va="bottom",
+                fontsize=FS - 4,
+                bbox=dict(boxstyle="round,pad=0.25", facecolor="white",
+                          edgecolor="none", alpha=0.85))
+
+    fig.suptitle(
+        f"Amplitude-based dynamic-seabed cost map  —  chosen threshold = {CHOSEN} m",
+        fontsize=FS_TITLE + 1, fontweight="bold",
+    )
+    _save_or_show(fig, save_path)
+
+
+# ---------------------------------------------------------------------------
+# Figure 26 — Combined cost-map overview (bathymetry + all 3 overlays)
+# ---------------------------------------------------------------------------
+
+def plot_combined_costmaps(save_path=None):
+    """
+    Bathymetry base (all cells combined, cmocean.deep) with three
+    semi-transparent risk overlays and both proposed routes.
+
+      Red  : sandwave detection probability (continuous alpha, prob = 1 → α 0.65)
+      Blue : high-variance cells  (log-std > 0.05, binary, α 0.55)
+      Gold : high-amplitude cells (amplitude > 0.08 m,   binary, α 0.60)
+
+    Where layers overlap the RGBA compositing naturally mixes the colours,
+    giving a visual indication of how many risk factors coincide.
+    """
+    import skimage as ski
+    import costmap as cm_mod
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
+
+    LABELS_DIR = "sandwave_detection_v8/labels"
+    VAR_DIR    = "variance_rasters/Rasters"
+    AMP_DIR    = "amplitude_rasters/Rasters_amp"
+    VAR_THRESH = 0.05
+    AMP_THRESH = 0.08
+    SW_ALPHA   = 0.65
+    VAR_ALPHA  = 0.55
+    AMP_ALPHA  = 0.60
+
+    def _load_cells(directory, transform_fn=None, combine_fn=None):
+        """Scan *directory*, group by cell id, combine, optional-transform, push into CostMap."""
+        if combine_fn is None:
+            combine_fn = np.nanmean
+        cmap_out = cm_mod.CostMap(dx=100, dy=100, default_cost=np.nan)
+        d: dict = {}
+        for fname in os.listdir(directory):
+            cid = fname.split("_")[1]
+            arr = np.load(os.path.join(directory, fname))[::-1, :]
+            d.setdefault(cid, []).append(arr)
+        for cid, rasters in d.items():
+            with np.errstate(invalid="ignore"):
+                avg = combine_fn(np.stack(rasters, axis=0), axis=0)
+            xs, xe, ys, ye = cmap_out.slice_cost_map(int(cid))
+            if transform_fn is not None:
+                avg = transform_fn(avg)
+            cmap_out.add_cost(xs, ys, cost=avg, x_idx_end=xe, y_idx_end=ye)
+        return cmap_out
+
+    # ---- Bathymetry ---------------------------------------------------------
+    print("  Loading bathymetry …", flush=True)
+    bath = _load_cells(
+        "destriped_rasters",
+        transform_fn=lambda a: ski.measure.block_reduce(a, block_size=5,
+                                                        func=np.nanmean),
+    )
+
+    # ---- Sandwave probability -----------------------------------------------
+    print("  Loading sandwave labels …", flush=True)
+    sw_raw = cm_mod.CostMap(dx=100, dy=100, default_cost=np.nan)
+    sw_d: dict = {}
+    for fname in [f for f in os.listdir(LABELS_DIR)
+                  if f.endswith("destriped_labels_smoothed.npy")]:
+        cid = fname.split("_")[1]
+        arr = np.load(os.path.join(LABELS_DIR, fname))[::-1, :].astype(float)
+        arr[arr == -1] = np.nan
+        sw_d.setdefault(cid, []).append(arr)
+    for cid, rasters in sw_d.items():
+        with np.errstate(invalid="ignore"):
+            avg = np.nanmean(np.stack(rasters, axis=0), axis=0)
+        rescaled = ski.measure.block_reduce(avg, block_size=5, func=np.max)
+        xs, xe, ys, ye = sw_raw.slice_cost_map(int(cid))
+        sw_raw.add_cost(xs, ys, cost=rescaled, x_idx_end=xe, y_idx_end=ye)
+
+    # ---- Variance (log-std) -------------------------------------------------
+    print("  Loading variance …", flush=True)
+    var_c = _load_cells(
+        VAR_DIR,
+        transform_fn=lambda a: np.log10(
+            np.sqrt(np.maximum(
+                ski.measure.block_reduce(a, block_size=5, func=np.nanmean), 0.0
+            )) + 1.0
+        ),
+    )
+
+    # ---- Amplitude ----------------------------------------------------------
+    print("  Loading amplitude …", flush=True)
+    amp_c = _load_cells(
+        AMP_DIR,
+        transform_fn=lambda a: ski.measure.block_reduce(a, block_size=5,
+                                                        func=np.nanmax),
+        combine_fn=np.nanmax,
+    )
+
+    # ---- Extent -------------------------------------------------------------
+    bl     = bath.bl
+    extent = [bl[0], bl[0] + 80_000, bl[1], bl[1] + 35_000]
+
+    # ---- Build RGBA overlays ------------------------------------------------
+    shape = bath.costs.shape
+
+    # Sandwave: red, alpha ∝ probability
+    sw_prob              = np.clip(np.where(np.isnan(sw_raw.costs), 0.0,
+                                            sw_raw.costs), 0.0, 1.0)
+    sw_rgba              = np.zeros((*shape, 4), dtype=float)
+    sw_rgba[..., 0]      = 0.84
+    sw_rgba[..., 1]      = 0.15
+    sw_rgba[..., 2]      = 0.16
+    sw_rgba[..., 3]      = sw_prob * SW_ALPHA
+
+    # Variance: vivid magenta (distinct from background blues/greens), binary
+    var_flag             = (~np.isnan(var_c.costs)) & (var_c.costs > VAR_THRESH)
+    var_rgba             = np.zeros((*shape, 4), dtype=float)
+    var_rgba[var_flag, 0] = 0.80
+    var_rgba[var_flag, 1] = 0.10
+    var_rgba[var_flag, 2] = 0.80
+    var_rgba[var_flag, 3] = VAR_ALPHA
+
+    # Amplitude: gold, binary
+    amp_flag             = (~np.isnan(amp_c.costs)) & (amp_c.costs > AMP_THRESH)
+    amp_rgba             = np.zeros((*shape, 4), dtype=float)
+    amp_rgba[amp_flag, 0] = 1.00
+    amp_rgba[amp_flag, 1] = 0.75
+    amp_rgba[amp_flag, 2] = 0.00
+    amp_rgba[amp_flag, 3] = AMP_ALPHA
+
+    # ---- Figure -------------------------------------------------------------
+    fig, ax = plt.subplots(figsize=(16, 7.5), constrained_layout=True)
+
+    cm_bath2 = copy.copy(CMAP_BATH)
+    cm_bath2.set_bad(NAN_COLOR)
+    im = ax.imshow(np.ma.masked_invalid(bath.costs),
+                   cmap=cm_bath2, origin="lower", extent=extent,
+                   interpolation="nearest", aspect="equal", zorder=1)
+    cbar = fig.colorbar(im, ax=ax, shrink=0.85, pad=0.02)
+    cbar.set_label("Depth  [m]", fontsize=FS - 2)
+    cbar.ax.tick_params(labelsize=FS - 3)
+
+    for rgba in (sw_rgba, var_rgba, amp_rgba):
+        ax.imshow(rgba, origin="lower", extent=extent,
+                  interpolation="nearest", zorder=2)
+
+    # ---- Routes -------------------------------------------------------------
+    ROUTE_FILES  = ["shapes/line1.shp", "shapes/line2.shp"]
+    ROUTE_COLORS = ["#aeea00", "#ff7f0e"]   # chartreuse + orange: both pop on blue-green
+    ROUTE_LABELS = ["Route 1", "Route 2"]
+    try:
+        import geopandas as gpd
+        for fpath, color, label in zip(ROUTE_FILES, ROUTE_COLORS, ROUTE_LABELS):
+            if os.path.exists(fpath):
+                gpd.read_file(fpath).to_crs(bath.csr).plot(
+                    ax=ax, color=color, linewidth=2.0, label=label, zorder=5)
+    except ImportError:
+        for route, color, label in zip(bath.routes, ROUTE_COLORS, ROUTE_LABELS):
+            ys_r, xs_r = np.where(route)
+            ax.scatter(bl[0] + xs_r * 100 + 50, bl[1] + ys_r * 100 + 50,
+                       c=color, s=2, zorder=5, label=label, linewidths=0)
+
+    # ---- Axes ---------------------------------------------------------------
+    ax.set_xlabel("Easting  [m, UTM 31N]", fontsize=FS)
+    ax.set_ylabel("Northing  [m, UTM 31N]", fontsize=FS)
+    ax.set_xlim(extent[0], extent[1])
+    ax.set_ylim(extent[2], extent[3])
+    ax.locator_params(axis="x", nbins=6)
+    ax.locator_params(axis="y", nbins=6)
+    plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=FS - 2)
+    plt.setp(ax.get_yticklabels(), fontsize=FS - 2)
+    ax.set_title("Combined dynamic-risk cost maps",
+                 fontsize=FS_TITLE + 1, fontweight="bold", pad=10)
+
+    # ---- Legend -------------------------------------------------------------
+    sw_patch  = Patch(facecolor=(0.84, 0.15, 0.16, SW_ALPHA),
+                      edgecolor="none", label="Sandwave detection  (prob. weighted)")
+    var_patch = Patch(facecolor=(0.80, 0.10, 0.80, VAR_ALPHA),
+                      edgecolor="none",
+                      label=f"High variance  (log-std > {VAR_THRESH})")
+    amp_patch = Patch(facecolor=(1.00, 0.75, 0.00, AMP_ALPHA),
+                      edgecolor="none",
+                      label=f"High amplitude  (> {AMP_THRESH} m)")
+    no_data   = Patch(facecolor=NAN_COLOR, edgecolor="none", label="No survey data")
+    route_handles = [
+        Line2D([0], [0], color=c, lw=2, label=l)
+        for c, l in zip(ROUTE_COLORS, ROUTE_LABELS)
+    ]
+    ax.legend(handles=[sw_patch, var_patch, amp_patch, no_data, *route_handles],
+              loc="upper left", fontsize=FS - 2, frameon=True, edgecolor="#cccccc")
+
+    _save_or_show(fig, save_path)
+
+
+# ---------------------------------------------------------------------------
+# Figure 25 — Cell 56 local-std masking pipeline
+# ---------------------------------------------------------------------------
+
+def plot_local_std_mask_cell(cell, cdi_a, cdi_b, save_path=None):
+    """
+    Six-panel illustration of the local-std masking pipeline for a given cell.
+
+    Row 0:  (a) Survey 1 bathymetry
+            (b) Survey 2 bathymetry          [shared depth scale with (a)]
+            (c) Change map: Survey 2 − Survey 1 (diverging colormap)
+
+    Row 1:  (d) Local std of change (√variance), full 250×250 resolution
+            (e) Log-std after 5× downscale to 50×50; threshold line at 0.05
+            (f) Dynamic-area mask (threshold = 0.05) overlaid on bathymetry
+    """
+    import skimage as ski
+    from matplotlib.colors import TwoSlopeNorm
+
+    CELL        = cell
+    CDI_A       = cdi_a   # Survey 1
+    CDI_B       = cdi_b   # Survey 2
+    VAR_FILE    = f"variance_rasters/Rasters/cell_{CELL}_local_var_diff_{CDI_B}_{CDI_A}.npy"
+    BATH_A_FILE = f"destriped_rasters/cell_{CELL}_CDI_{CDI_A}_destriped.npy"
+    BATH_B_FILE = f"destriped_rasters/cell_{CELL}_CDI_{CDI_B}_destriped.npy"
+    VAR_THRESH  = 0.05
+
+    # ---- Load data ----------------------------------------------------------
+    r1  = np.load(BATH_A_FILE)           # 250×250, depths in m
+    r2  = np.load(BATH_B_FILE)
+    var = np.load(VAR_FILE)              # local variance of (r2-r1), 250×250
+
+    diff = r2 - r1                       # change map
+    std_full = np.sqrt(np.maximum(var, 0.0))   # local std, 250×250
+
+    # Downscale & log-transform (replicates build_variance_costmap pipeline)
+    rescaled    = ski.measure.block_reduce(var, block_size=5, func=np.nanmean)  # 50×50
+    log_std     = np.log10(np.sqrt(np.maximum(rescaled, 0.0)) + 1.0)           # 50×50
+    mask_binary = (log_std > VAR_THRESH).astype(float)
+
+    # Average bathymetry for overlay panel, also downscaled to 50×50
+    bath_avg    = np.nanmean(np.stack([r1, r2], axis=0), axis=0)
+    bath_ds     = ski.measure.block_reduce(bath_avg, block_size=5, func=np.nanmean)
+
+    nan_mask_full = np.isnan(r1) | np.isnan(r2)
+    nan_mask_ds   = ski.measure.block_reduce(
+        nan_mask_full.astype(float), block_size=5, func=np.max).astype(bool)
+
+    # ---- Shared colour limits -----------------------------------------------
+    vmin_b = float(np.nanpercentile(np.stack([r1, r2]), 2))
+    vmax_b = float(np.nanpercentile(np.stack([r1, r2]), 98))
+    diff_abs = float(np.nanpercentile(np.abs(diff), 98))
+    std_vmax = float(np.nanpercentile(std_full, 99))
+    log_vmax = float(np.nanpercentile(log_std,  99))
+
+    cm_bath2 = copy.copy(CMAP_BATH); cm_bath2.set_bad(NAN_COLOR)
+    cm_std   = copy.copy(plt.colormaps["YlOrRd"]); cm_std.set_bad(NAN_COLOR)
+
+    # ---- Layout -------------------------------------------------------------
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10),
+                             constrained_layout=True)
+    ax_b1, ax_b2, ax_ch = axes[0]
+    ax_sd, ax_ls, ax_mk = axes[1]
+
+    def _off(ax):
+        ax.set_xticks([]); ax.set_yticks([])
+
+    # ---- (a) Survey 1 -------------------------------------------------------
+    im_b = ax_b1.imshow(np.ma.masked_where(nan_mask_full, r1),
+                        cmap=cm_bath2, vmin=vmin_b, vmax=vmax_b, origin="upper")
+    _off(ax_b1)
+    ax_b1.set_title(f"(a) Survey 1  (CDI {CDI_A})", fontsize=FS_TITLE, pad=5)
+    fig.colorbar(im_b, ax=ax_b1, shrink=0.85, label="Depth  [m]")
+
+    # ---- (b) Survey 2 -------------------------------------------------------
+    ax_b2.imshow(np.ma.masked_where(nan_mask_full, r2),
+                 cmap=cm_bath2, vmin=vmin_b, vmax=vmax_b, origin="upper")
+    _off(ax_b2)
+    ax_b2.set_title(f"(b) Survey 2  (CDI {CDI_B})", fontsize=FS_TITLE, pad=5)
+    fig.colorbar(
+        plt.cm.ScalarMappable(
+            norm=plt.Normalize(vmin_b, vmax_b), cmap=cm_bath2),
+        ax=ax_b2, shrink=0.85, label="Depth  [m]")
+
+    # ---- (c) Change map -----------------------------------------------------
+    diff_norm = TwoSlopeNorm(vmin=-diff_abs, vcenter=0, vmax=diff_abs)
+    im_ch = ax_ch.imshow(np.ma.masked_where(nan_mask_full, diff),
+                         cmap="RdBu_r", norm=diff_norm, origin="upper")
+    _off(ax_ch)
+    ax_ch.set_title("(c) Change: Survey 2 − Survey 1", fontsize=FS_TITLE, pad=5)
+    fig.colorbar(im_ch, ax=ax_ch, shrink=0.85, label="Δdepth  [m]")
+
+    # ---- (d) Local std of change (full resolution) --------------------------
+    im_sd = ax_sd.imshow(np.ma.masked_where(nan_mask_full, std_full),
+                         cmap=cm_std, vmin=0, vmax=std_vmax, origin="upper")
+    _off(ax_sd)
+    ax_sd.set_title("(d) Local std of change  (250×250)", fontsize=FS_TITLE, pad=5)
+    fig.colorbar(im_sd, ax=ax_sd, shrink=0.85, label="Std  [m]")
+
+    # ---- (e) Log-std after 5× downscale, threshold annotated ---------------
+    im_ls = ax_ls.imshow(np.ma.masked_where(nan_mask_ds, log_std),
+                         cmap=cm_std, vmin=0, vmax=log_vmax, origin="upper")
+    _off(ax_ls)
+    ax_ls.set_title(r"(e) $\log_{10}(\mathrm{std}+1)$ after 5× downscale  (50×50)",
+                    fontsize=FS_TITLE, pad=5)
+    cb_ls = fig.colorbar(im_ls, ax=ax_ls, shrink=0.85,
+                         label=r"$\log_{10}(\sqrt{\sigma^2}+1)$  [–]")
+    # Mark threshold on colorbar
+    cb_ls.ax.axhline(y=VAR_THRESH / log_vmax, color=HIGHLIGHT_COLOR, lw=2.0)
+    cb_ls.ax.text(0.5, VAR_THRESH / log_vmax + 0.03, f"t = {VAR_THRESH}",
+                  transform=cb_ls.ax.transAxes, ha="center", va="bottom",
+                  fontsize=FS - 4, color=HIGHLIGHT_COLOR, fontweight="bold")
+    frac = float(np.mean(mask_binary[~nan_mask_ds])) * 100
+    ax_ls.text(0.97, 0.03, f"{frac:.0f} % flagged",
+               transform=ax_ls.transAxes, ha="right", va="bottom",
+               fontsize=FS - 3,
+               bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                         edgecolor="none", alpha=0.85))
+
+    # ---- (f) Binary mask overlaid on downscaled bathymetry ------------------
+    ax_mk.imshow(np.ma.masked_where(nan_mask_ds, bath_ds),
+                 cmap=cm_bath2, vmin=vmin_b, vmax=vmax_b, origin="upper")
+    # Red overlay where flagged
+    red_overlay        = np.zeros((*mask_binary.shape, 4), dtype=float)
+    red_overlay[..., 0] = 0.84
+    red_overlay[..., 1] = 0.15
+    red_overlay[..., 2] = 0.16
+    red_overlay[..., 3] = np.where(~nan_mask_ds & (mask_binary == 1), 0.65, 0.0)
+    ax_mk.imshow(red_overlay, origin="upper")
+    _off(ax_mk)
+    ax_mk.set_title(f"(f) Dynamic-area mask  (t = {VAR_THRESH})", fontsize=FS_TITLE, pad=5)
+    from matplotlib.patches import Patch
+    ax_mk.legend(
+        handles=[Patch(facecolor=(0.84, 0.15, 0.16, 0.65), label="Flagged (dynamic)"),
+                 Patch(facecolor=NAN_COLOR, label="No data")],
+        loc="lower right", fontsize=FS - 4, frameon=True, edgecolor="#cccccc")
+
+    fig.suptitle(
+        f"Cell {CELL}: local-std masking pipeline  "
+        f"(surveys {CDI_A} & {CDI_B}, threshold = {VAR_THRESH})",
+        fontsize=FS_TITLE + 1, fontweight="bold",
+    )
+    _save_or_show(fig, save_path)
+
+
+def plot_local_std_mask_cell56(save_path=None):
+    plot_local_std_mask_cell(56, cdi_a=2174760, cdi_b=3844672, save_path=save_path)
+
+
+def plot_local_std_mask_cell39(save_path=None):
+    plot_local_std_mask_cell(39, cdi_a=2174760, cdi_b=3844672, save_path=save_path)
+
+
+# ---------------------------------------------------------------------------
+# Figure 27 — A* optimised route: unrestricted vs N2000 exclusion
+# ---------------------------------------------------------------------------
+
+def plot_optimised_route(save_path=None, fill_nn=False):
+    """
+    Two-panel (stacked) comparison of the A*-optimised pipeline route:
+      Top    : Optimised route on the combined risk cost map (no exclusion zones).
+      Bottom : Same cost map but with N2000 areas blocked (cost = -1, impassable).
+
+    Background    : Combined destriped bathymetry (cmocean.deep).
+    Risk overlays : Same three layers as Fig 26 (sandwave / variance / amplitude).
+    N2000 overlay : Gray semi-transparent mask in the bottom panel only.
+    A* path       : White line with dark outline for maximum contrast.
+    Ref routes    : Chartreuse (Route 1) and orange (Route 2) for comparison.
+
+    Routing parameters match test_optimiser.run():
+      momentum=8, max_turn_steps=1, heuristic_weight=1.0, rescale_factor=1.
+    """
+    import skimage as ski
+    import costmap as cm_mod
+    from Astar import AStarPlanner
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
+    from matplotlib.patheffects import withStroke
+
+    LABELS_DIR = "sandwave_detection_v8/labels"
+    VAR_DIR    = "variance_rasters/Rasters"
+    AMP_DIR    = "amplitude_rasters/Rasters_amp"
+    N2K_SHP    = "shapes/n200.shp"
+
+    VAR_THRESH = 0.05
+    AMP_THRESH = 0.08
+    SW_ALPHA   = 0.65
+    VAR_ALPHA  = 0.55
+    AMP_ALPHA  = 0.60
+    N2K_ALPHA  = 0.72
+
+    ROUTE_FILES  = ["shapes/line1.shp", "shapes/line2.shp"]
+    ROUTE_COLORS = ["#aeea00", "#ff7f0e"]   # chartreuse + orange (same as Fig 26)
+    ROUTE_LABELS = ["Route 1 (proposed)", "Route 2 (proposed)"]
+    PATH_COLOR   = "white"
+    PATH_EDGE    = "#111111"
+
+    # ---- Helpers ----------------------------------------------------------------
+    def _load_dir(directory, suffix=None):
+        d: dict = {}
+        for fname in os.listdir(directory):
+            if suffix and not fname.endswith(suffix):
+                continue
+            cid = fname.split("_")[1]
+            arr = np.load(os.path.join(directory, fname))[::-1, :]
+            d.setdefault(cid, []).append(arr)
+        return d
+
+    def _combine(rasters, func=np.nanmean):
+        stacked = np.stack(rasters, axis=0)
+        with np.errstate(invalid="ignore"):
+            return func(stacked, axis=0)
+
+    # ---- Bathymetry (also serves as the nan-mask source) -------------------------
+    print("  Building bathymetry …", flush=True)
+    bath = cm_mod.CostMap(dx=100, dy=100, default_cost=np.nan)
+    raster_d = _load_dir("destriped_rasters")
+    for cid, rasters in raster_d.items():
+        avg      = _combine(rasters, np.nanmean)
+        rescaled = ski.measure.block_reduce(avg, block_size=5, func=np.nanmean)
+        xs, xe, ys, ye = bath.slice_cost_map(int(cid))
+        bath.add_cost(xs, ys, cost=rescaled, x_idx_end=xe, y_idx_end=ye)
+
+    # ---- Sandwave probability (0–1, continuous) ----------------------------------
+    print("  Loading sandwave labels …", flush=True)
+    sw_cm = cm_mod.CostMap(dx=100, dy=100, default_cost=np.nan)
+    for cid, rasters in _load_dir(LABELS_DIR,
+                                   suffix="destriped_labels_smoothed.npy").items():
+        rasters = [r.astype(float) for r in rasters]
+        for r in rasters:
+            r[r == -1] = np.nan
+        avg      = _combine(rasters, np.nanmean)
+        rescaled = ski.measure.block_reduce(avg, block_size=5, func=np.max)
+        xs, xe, ys, ye = sw_cm.slice_cost_map(int(cid))
+        sw_cm.add_cost(xs, ys, cost=rescaled, x_idx_end=xe, y_idx_end=ye)
+
+    # ---- Variance (log-std, raw; binarised for routing) -------------------------
+    print("  Loading variance …", flush=True)
+    var_cm = cm_mod.CostMap(dx=100, dy=100, default_cost=np.nan)
+    for cid, rasters in _load_dir(VAR_DIR).items():
+        avg         = _combine(rasters, np.nanmean)
+        rescaled    = ski.measure.block_reduce(avg, block_size=5, func=np.nanmean)
+        transformed = np.log10(np.sqrt(np.maximum(rescaled, 0.0)) + 1.0)
+        xs, xe, ys, ye = var_cm.slice_cost_map(int(cid))
+        var_cm.add_cost(xs, ys, cost=transformed, x_idx_end=xe, y_idx_end=ye)
+
+    # Binarised copy for routing cost (1 where above threshold, NaN elsewhere)
+    var_bin = cm_mod.CostMap(dx=100, dy=100, default_cost=np.nan)
+    var_bin.set_cost(None, None,
+                     cost=np.where((~np.isnan(var_cm.costs)) &
+                                   (var_cm.costs > VAR_THRESH), 1.0, np.nan))
+
+    # ---- Amplitude (raw; binarised for routing) ----------------------------------
+    print("  Loading amplitude …", flush=True)
+    amp_cm = cm_mod.CostMap(dx=100, dy=100, default_cost=np.nan)
+    for cid, rasters in _load_dir(AMP_DIR).items():
+        avg      = _combine(rasters, np.nanmax)
+        rescaled = ski.measure.block_reduce(avg, block_size=5, func=np.nanmax)
+        xs, xe, ys, ye = amp_cm.slice_cost_map(int(cid))
+        amp_cm.add_cost(xs, ys, cost=rescaled, x_idx_end=xe, y_idx_end=ye)
+
+    amp_bin = cm_mod.CostMap(dx=100, dy=100, default_cost=np.nan)
+    amp_bin.set_cost(None, None,
+                     cost=np.where((~np.isnan(amp_cm.costs)) &
+                                   (amp_cm.costs > AMP_THRESH), 1.0, np.nan))
+
+    # ---- Build routing cost grids (matching test_optimiser.run()) ---------------
+    def _routing_grid(with_n2000: bool) -> np.ndarray:
+        """Replicate the cost-map assembly in test_optimiser.run()."""
+        costmap = cm_mod.CostMap(dx=100, dy=100, default_cost=1)
+        costmap.add_cost(None, None, cost=sw_cm.costs)   # continuous sandwave prob
+        costmap.add_cost(None, None, cost=var_bin.costs)  # binary variance flag
+        costmap.add_cost(None, None, cost=amp_bin.costs)  # binary amplitude flag
+        costmap.set_nans(bath)                            # NaN where no bathymetry
+        if with_n2000:
+            try:
+                costmap.block_n2000(path=N2K_SHP)        # -1 (impassable) in N2000
+            except Exception as exc:
+                print(f"    [warn] block_n2000 failed: {exc}", flush=True)
+        if fill_nn:
+            costmap.fill_nans_nn(max_gap=1000)            # small gaps → nearest-neighbour
+            costmap.fill_nans_high_cost()                 # remaining large gaps → max cost
+        else:
+            costmap.fill_nans_high_cost()                 # NaN → max finite cost
+        return costmap.costs
+
+    print("  Building routing cost grids …", flush=True)
+    grid_free = _routing_grid(with_n2000=False)
+    grid_n2k  = _routing_grid(with_n2000=True)
+
+    # ---- N2000 mask for the visualisation overlay --------------------------------
+    n2k_mask = np.zeros(bath.costs.shape, dtype=bool)
+    try:
+        temp = cm_mod.CostMap(dx=100, dy=100, default_cost=0.0)
+        arr  = np.zeros(bath.costs.shape, dtype=float)
+        temp.block_n2000(array=arr, path=N2K_SHP)
+        n2k_mask = (arr == -1)
+    except Exception as exc:
+        print(f"  [warn] N2000 mask not available: {exc}", flush=True)
+
+    # ---- Start / goal indices (match test_optimiser.run()) ----------------------
+    ref_cm = cm_mod.CostMap(dx=100, dy=100, default_cost=1)
+
+    # Route cost helper (needs ref_cm.routes and both grids)
+    route_masks = ref_cm.routes   # list of bool arrays, one per shapefile
+    grids = {"free": grid_free, "n2k": grid_n2k}
+
+    def _route_cost(grid, mask):
+        """Sum cell costs along a boolean route mask, ignoring no-go cells."""
+        valid = mask & np.isfinite(grid) & (grid > 0)
+        return float(grid[valid].sum())
+
+    sx, sy = ref_cm.start_utm
+    ex, ey = ref_cm.end_utm
+    sx_idx, sy_idx = ref_cm.get_idx_from_coordinates(sx, sy)
+    ex_idx, ey_idx = ref_cm.get_idx_from_coordinates(ex, ey)
+
+    # ---- Run A* for both scenarios ----------------------------------------------
+    paths: dict = {}
+    for label, grid in [("free", grid_free), ("n2k", grid_n2k)]:
+        print(f"  Running A* ({label}) …", flush=True)
+        planner = AStarPlanner(
+            cost_grid=grid,
+            max_turn_steps=1,
+            heuristic_weight=1.0,
+            momentum=8,
+        )
+        try:
+            result = planner.solve(
+                start=(sy_idx, sx_idx),
+                goal=(ey_idx, ex_idx),
+                start_heading=None,
+                goal_heading=None,
+            )
+            paths[label] = result
+            if result:
+                print(f"    -> {len(result.coords)} steps, "
+                      f"cost {result.total_cost:.1f}", flush=True)
+            else:
+                print("    -> no path found", flush=True)
+        except Exception as exc:
+            print(f"    -> A* failed: {exc}", flush=True)
+            paths[label] = None
+
+    # ---- Optional NN fill of bathymetry NaNs (for display only) ----------------
+    # Routing grids are already built so modifying bath.costs here is safe.
+    if fill_nn:
+        print("  Filling bathymetry NaNs (nearest-neighbour, max_gap=1000) …", flush=True)
+        bath.fill_nans_nn(max_gap=1000)
+
+    # ---- RGBA overlays (same palette as Fig 26) ---------------------------------
+    bl     = bath.bl
+    extent = [bl[0], bl[0] + 80_000, bl[1], bl[1] + 35_000]
+    shape  = bath.costs.shape
+
+    sw_prob         = np.clip(np.where(np.isnan(sw_cm.costs), 0.0, sw_cm.costs),
+                              0.0, 1.0)
+    sw_rgba         = np.zeros((*shape, 4), dtype=float)
+    sw_rgba[..., 0] = 0.84; sw_rgba[..., 1] = 0.15; sw_rgba[..., 2] = 0.16
+    sw_rgba[..., 3] = sw_prob * SW_ALPHA
+
+    var_flag          = (~np.isnan(var_cm.costs)) & (var_cm.costs > VAR_THRESH)
+    var_rgba          = np.zeros((*shape, 4), dtype=float)
+    var_rgba[var_flag, 0] = 0.80; var_rgba[var_flag, 1] = 0.10
+    var_rgba[var_flag, 2] = 0.80; var_rgba[var_flag, 3] = VAR_ALPHA
+
+    amp_flag          = (~np.isnan(amp_cm.costs)) & (amp_cm.costs > AMP_THRESH)
+    amp_rgba          = np.zeros((*shape, 4), dtype=float)
+    amp_rgba[amp_flag, 0] = 1.00; amp_rgba[amp_flag, 1] = 0.75
+    amp_rgba[amp_flag, 2] = 0.00; amp_rgba[amp_flag, 3] = AMP_ALPHA
+
+    n2k_rgba          = np.zeros((*shape, 4), dtype=float)
+    n2k_rgba[n2k_mask, 0] = 0.50; n2k_rgba[n2k_mask, 1] = 0.50
+    n2k_rgba[n2k_mask, 2] = 0.50; n2k_rgba[n2k_mask, 3] = N2K_ALPHA
+
+    # ---- Helper: A* path (row, col) → UTM (x, y) --------------------------------
+    def _path_utm(result):
+        if result is None:
+            return None, None
+        xs = [bl[0] + col * 100 + 50 for (row, col) in result.coords]
+        ys = [bl[1] + row * 100 + 50 for (row, col) in result.coords]
+        return xs, ys
+
+    # ---- Figure (2 rows × 1 col) ------------------------------------------------
+    fig, axes = plt.subplots(2, 1, figsize=(16, 13), constrained_layout=True)
+
+    cm_bath2 = copy.copy(CMAP_BATH)
+    cm_bath2.set_bad(NAN_COLOR)
+
+    configs = [
+        ("free", "Optimised route — unrestricted",                False),
+        ("n2k",  "Optimised route — N2000 zones excluded",        True),
+    ]
+    im_ref = None
+
+    for ax, (key, title, show_n2k) in zip(axes, configs):
+        # Bathymetry base (NN-filled → no masking needed; else mask NaNs)
+        bath_data = bath.costs if fill_nn else np.ma.masked_invalid(bath.costs)
+        im = ax.imshow(
+            bath_data,
+            cmap=cm_bath2, origin="lower", extent=extent,
+            interpolation="nearest", aspect="equal", zorder=1,
+        )
+        if im_ref is None:
+            im_ref = im
+
+        # Risk overlays
+        for rgba in (sw_rgba, var_rgba, amp_rgba):
+            ax.imshow(rgba, origin="lower", extent=extent,
+                      interpolation="nearest", zorder=2)
+
+        # N2000 overlay (bottom panel only)
+        if show_n2k and n2k_mask.any():
+            ax.imshow(n2k_rgba, origin="lower", extent=extent,
+                      interpolation="nearest", zorder=3)
+
+        # Reference routes (vector lines via geopandas)
+        try:
+            import geopandas as gpd
+            for fpath, color, rlabel in zip(ROUTE_FILES, ROUTE_COLORS, ROUTE_LABELS):
+                if os.path.exists(fpath):
+                    gpd.read_file(fpath).to_crs(bath.csr).plot(
+                        ax=ax, color=color, linewidth=2.0, label=rlabel, zorder=5)
+        except ImportError:
+            pass
+
+        # A* path — white with dark outline via path_effects
+        xs_p, ys_p = _path_utm(paths[key])
+        if xs_p is not None:
+            ax.plot(
+                xs_p, ys_p,
+                color=PATH_COLOR, lw=2.2,
+                solid_capstyle="round", solid_joinstyle="round",
+                path_effects=[withStroke(linewidth=4.5, foreground=PATH_EDGE)],
+                zorder=7,
+            )
+
+        # ---- Legend (per panel, with costs) ------------------------------------
+        sw_patch  = Patch(facecolor=(0.84, 0.15, 0.16, SW_ALPHA), edgecolor="none",
+                          label="Sandwave detection  (prob. weighted)")
+        var_patch = Patch(facecolor=(0.80, 0.10, 0.80, VAR_ALPHA), edgecolor="none",
+                          label=f"High variance  (log-std > {VAR_THRESH})")
+        amp_patch = Patch(facecolor=(1.00, 0.75, 0.00, AMP_ALPHA), edgecolor="none",
+                          label=f"High amplitude  (> {AMP_THRESH} m)")
+        n2k_patch = Patch(facecolor=(0.50, 0.50, 0.50, N2K_ALPHA), edgecolor="none",
+                          label="N2000 exclusion zone  (impassable)")
+
+        astar_cost = paths[key].total_cost if paths[key] else float("nan")
+        path_line_h = Line2D(
+            [0], [0], color=PATH_COLOR, lw=2.2,
+            path_effects=[withStroke(linewidth=4.5, foreground=PATH_EDGE)],
+            label=f"A* optimal route  (cost: {astar_cost:.0f})",
+        )
+        grid_for_cost = grids[key]
+        route_hdl = [
+            Line2D([0], [0], color=c, lw=2,
+                   label=f"{l}  (cost: {_route_cost(grid_for_cost, mask):.0f})")
+            for c, l, mask in zip(ROUTE_COLORS, ROUTE_LABELS, route_masks)
+        ]
+
+        leg_handles = [path_line_h, *route_hdl, sw_patch, var_patch, amp_patch]
+        if not fill_nn:
+            no_data = Patch(facecolor=NAN_COLOR, edgecolor="none", label="No survey data")
+            leg_handles.append(no_data)
+        if show_n2k:
+            leg_handles.insert(1, n2k_patch)
+        ax.legend(handles=leg_handles, loc="upper left",
+                  fontsize=FS - 4, frameon=True, edgecolor="#cccccc")
+
+        # Axes
+        ax.set_title(title, fontsize=FS_TITLE, pad=7, fontweight="bold")
+        ax.set_xlabel("Easting  [m, UTM 31N]", fontsize=FS - 2)
+        ax.set_ylabel("Northing  [m, UTM 31N]", fontsize=FS - 2)
+        ax.set_xlim(extent[0], extent[1])
+        ax.set_ylim(extent[2], extent[3])
+        ax.locator_params(axis="x", nbins=6)
+        ax.locator_params(axis="y", nbins=6)
+        plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=FS - 3)
+        plt.setp(ax.get_yticklabels(), fontsize=FS - 3)
+
+    # Shared colorbar on the right
+    if im_ref is not None:
+        cbar = fig.colorbar(im_ref, ax=axes.tolist(), shrink=0.75, pad=0.02)
+        cbar.set_label("Depth  [m]", fontsize=FS - 2)
+        cbar.ax.tick_params(labelsize=FS - 3)
+
+    fig.suptitle(
+        "A* optimised pipeline route  "
+        "(momentum = 8,  max turn = 45°,  100 m cell resolution)",
+        fontsize=FS_TITLE + 1, fontweight="bold",
+    )
+    _save_or_show(fig, save_path)
+
+
+def plot_optimised_route_nn(save_path=None):
+    """Like plot_optimised_route but with NaN bathymetry cells filled by nearest-neighbour."""
+    plot_optimised_route(save_path=save_path, fill_nn=True)
+
+
+# ---------------------------------------------------------------------------
+# Figures 28/28b — Sensitivity analysis: route frequency heatmap + consensus
+# ---------------------------------------------------------------------------
+
+def plot_sensitivity_route(save_path=None, fill_nn=False):
+    """
+    Two-panel sensitivity analysis of the A* pipeline route.
+
+    Runs A* n=100 times with perturbed cost maps (Gaussian noise σ=0.1),
+    builds a route-frequency heatmap, then finds the consensus route via A*
+    on an inverse-frequency cost map.
+
+    Parameters match run_sensitivity_analysis() in test_optimiser.py:
+      n=100, sigma=0.1, rescale_factor=4, momentum=2.
+
+    Top panel   : Unrestricted routing.
+    Bottom panel: N2000 zones blocked (cost = -1, impassable).
+    """
+    import skimage as ski
+    import costmap as cm_mod
+    from Astar import AStarPlanner
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
+    from matplotlib.patheffects import withStroke
+
+    # ---- Parameters ------------------------------------------------------------
+    N          = 100
+    SIGMA      = 0.5
+    VAR_THRESH = 0.05
+    AMP_THRESH = 0.08
+    RESCALE    = 4
+    MOMENTUM   = 2
+
+    LABELS_DIR = "sandwave_detection_v8/labels"
+    VAR_DIR    = "variance_rasters/Rasters"
+    AMP_DIR    = "amplitude_rasters/Rasters_amp"
+    N2K_SHP    = "shapes/n200.shp"
+
+    SW_ALPHA   = 0.45
+    VAR_ALPHA  = 0.40
+    AMP_ALPHA  = 0.45
+    N2K_ALPHA  = 0.60
+    HEAT_ALPHA = 0.70
+
+    ROUTE_FILES  = ["shapes/line1.shp", "shapes/line2.shp"]
+    ROUTE_COLORS = ["#aeea00", "#ff7f0e"]
+    ROUTE_LABELS = ["Route 1 (proposed)", "Route 2 (proposed)"]
+    PATH_COLOR   = "white"
+    PATH_EDGE    = "#111111"
+
+    # ---- Helpers ---------------------------------------------------------------
+    def _load_dir(directory, suffix=None):
+        d = {}
+        for fname in os.listdir(directory):
+            if suffix and not fname.endswith(suffix):
+                continue
+            cid = fname.split("_")[1]
+            arr = np.load(os.path.join(directory, fname))[::-1, :]
+            d.setdefault(cid, []).append(arr)
+        return d
+
+    def _combine(rasters, func=np.nanmean):
+        stacked = np.stack(rasters, axis=0)
+        with np.errstate(invalid="ignore"):
+            return func(stacked, axis=0)
+
+    def _add_noise(arr, sigma):
+        noisy = arr + np.random.normal(0, sigma, arr.shape)
+        return np.where((~np.isnan(arr)) & (arr != 0), noisy, arr)
+
+    # ---- Load data layers (full resolution 800×350) ----------------------------
+    print("  Building bathymetry …", flush=True)
+    bath = cm_mod.CostMap(dx=100, dy=100, default_cost=np.nan)
+    for cid, rasters in _load_dir("destriped_rasters").items():
+        avg = _combine(rasters, np.nanmean)
+        rs  = ski.measure.block_reduce(avg, block_size=5, func=np.nanmean)
+        xs, xe, ys, ye = bath.slice_cost_map(int(cid))
+        bath.add_cost(xs, ys, cost=rs, x_idx_end=xe, y_idx_end=ye)
+
+    print("  Loading sandwave labels …", flush=True)
+    sw_cm = cm_mod.CostMap(dx=100, dy=100, default_cost=np.nan)
+    for cid, rasters in _load_dir(LABELS_DIR,
+                                   suffix="destriped_labels_smoothed.npy").items():
+        rasters = [r.astype(float) for r in rasters]
+        for r in rasters:
+            r[r == -1] = np.nan
+        avg = _combine(rasters, np.nanmean)
+        rs  = ski.measure.block_reduce(avg, block_size=5, func=np.max)
+        xs, xe, ys, ye = sw_cm.slice_cost_map(int(cid))
+        sw_cm.add_cost(xs, ys, cost=rs, x_idx_end=xe, y_idx_end=ye)
+
+    print("  Loading variance …", flush=True)
+    var_cm = cm_mod.CostMap(dx=100, dy=100, default_cost=np.nan)
+    for cid, rasters in _load_dir(VAR_DIR).items():
+        avg = _combine(rasters, np.nanmean)
+        rs  = ski.measure.block_reduce(avg, block_size=5, func=np.nanmean)
+        ts  = np.log10(np.sqrt(np.maximum(rs, 0.0)) + 1.0)
+        xs, xe, ys, ye = var_cm.slice_cost_map(int(cid))
+        var_cm.add_cost(xs, ys, cost=ts, x_idx_end=xe, y_idx_end=ye)
+
+    print("  Loading amplitude …", flush=True)
+    amp_cm = cm_mod.CostMap(dx=100, dy=100, default_cost=np.nan)
+    for cid, rasters in _load_dir(AMP_DIR).items():
+        avg = _combine(rasters, np.nanmax)
+        rs  = ski.measure.block_reduce(avg, block_size=5, func=np.nanmax)
+        xs, xe, ys, ye = amp_cm.slice_cost_map(int(cid))
+        amp_cm.add_cost(xs, ys, cost=rs, x_idx_end=xe, y_idx_end=ye)
+
+    # ---- Base arrays for sensitivity (fixed across iterations) -----------------
+    full_shape      = bath.costs.shape
+    nan_mask_full   = np.isnan(bath.costs)
+    sw_base         = sw_cm.costs.copy()
+    var_base_thresh = np.where(
+        (~np.isnan(var_cm.costs)) & (var_cm.costs > VAR_THRESH), 1.0, np.nan)
+    amp_base_thresh = np.where(
+        (~np.isnan(amp_cm.costs)) & (amp_cm.costs > AMP_THRESH), 1.0, np.nan)
+
+    # ---- N2000 mask (boolean, full resolution) ----------------------------------
+    n2k_mask = np.zeros(full_shape, dtype=bool)
+    try:
+        arr = np.zeros(full_shape, dtype=float)
+        cm_mod.CostMap(dx=100, dy=100, default_cost=0.0).block_n2000(
+            array=arr, path=N2K_SHP)
+        n2k_mask = (arr == -1)
+    except Exception as exc:
+        print(f"  [warn] N2000 mask: {exc}", flush=True)
+
+    # ---- Start / goal indices ---------------------------------------------------
+    ref_cm = cm_mod.CostMap(dx=100, dy=100, default_cost=1)
+    sx, sy = ref_cm.start_utm
+    ex, ey = ref_cm.end_utm
+    sx_idx, sy_idx = ref_cm.get_idx_from_coordinates(sx, sy)
+    ex_idx, ey_idx = ref_cm.get_idx_from_coordinates(ex, ey)
+    sx_rs = sx_idx // RESCALE
+    sy_rs = sy_idx // RESCALE
+    ex_rs = ex_idx // RESCALE
+    ey_rs = ey_idx // RESCALE
+
+    # Rescaled masks
+    nan_mask_rs = ski.measure.block_reduce(
+        nan_mask_full.astype(float), block_size=RESCALE, func=np.max).astype(bool)
+    n2k_mask_rs = ski.measure.block_reduce(
+        n2k_mask.astype(float), block_size=RESCALE, func=np.max).astype(bool)
+
+    # ---- Precompute NN fill info (only needed when fill_nn=True) ---------------
+    # Building the KD-tree once avoids rebuilding it 2×N times in the loop.
+    fill_mask_precomp = None
+    nn_idx_precomp    = None
+    if fill_nn:
+        from scipy.ndimage import label as _label
+        from scipy.spatial import cKDTree as _cKDTree
+        _ri, _ci = np.indices(full_shape)
+        _valid_pos = np.column_stack([_ri[~nan_mask_full], _ci[~nan_mask_full]])
+        _tree = _cKDTree(_valid_pos)
+        _labeled, _n_comp = _label(nan_mask_full)
+        _sizes = np.bincount(_labeled.ravel())
+        fill_mask_precomp = np.zeros_like(nan_mask_full)
+        for _i in range(1, _n_comp + 1):
+            if _sizes[_i] <= 1000:
+                fill_mask_precomp |= _labeled == _i
+        _fill_pos = np.column_stack([_ri[fill_mask_precomp], _ci[fill_mask_precomp]])
+        _, nn_idx_precomp = _tree.query(_fill_pos)
+        del _ri, _ci, _labeled, _tree  # free memory
+
+    # ---- Sensitivity analysis inner loop ---------------------------------------
+    def _run_sensitivity(with_n2000):
+        routes    = []
+        rs_shape  = None
+
+        for i in range(N):
+            if (i + 1) % 20 == 0:
+                print(f"    iteration {i + 1}/{N}", flush=True)
+
+            c1 = _add_noise(sw_base, SIGMA)
+            c2 = _add_noise(var_base_thresh, SIGMA)
+            c3 = _add_noise(amp_base_thresh, SIGMA)
+            cb = _add_noise(np.ones(full_shape), SIGMA)
+
+            combined = cm_mod.nansum([cb, c1, c2, c3], axis=0)
+            combined[nan_mask_full] = np.nan
+
+            if fill_nn:
+                # Fill small NaN holes via precomputed NN indices
+                valid_vals = combined[~nan_mask_full]
+                combined[fill_mask_precomp] = valid_vals[nn_idx_precomp]
+                # Fill any remaining large-hole NaN with max cost
+                remaining = np.isnan(combined)
+                if remaining.any():
+                    combined[remaining] = float(np.nanmax(combined))
+            else:
+                finite = combined[~np.isnan(combined)]
+                combined[np.isnan(combined)] = float(np.nanmax(finite)) if finite.size else 1.0
+
+            if with_n2000:
+                combined[n2k_mask] = -1.0
+
+            if RESCALE > 1:
+                combined = ski.measure.block_reduce(
+                    combined, block_size=RESCALE, func=np.nanmax)
+                rs_shape = combined.shape
+
+            planner = AStarPlanner(
+                cost_grid=combined, max_turn_steps=1,
+                heuristic_weight=1.0, momentum=MOMENTUM,
+            )
+            try:
+                result = planner.solve(
+                    start=(sy_rs, sx_rs), goal=(ey_rs, ex_rs),
+                    start_heading=None, goal_heading=None,
+                )
+            except Exception:
+                result = None
+            if result is not None:
+                routes.append(result)
+
+        shape_used = rs_shape if rs_shape is not None else full_shape
+        heatmap    = np.zeros(shape_used)
+        for route in routes:
+            heatmap += route.get_numpy_path()
+
+        # Consensus: A* on inverse-frequency cost
+        heatmap_f      = np.where(heatmap == 0, 0.0, heatmap)
+        consensus_cost = (N + 1) / (heatmap_f + 1)
+        consensus_cost[nan_mask_rs] = float(np.nanmax(consensus_cost))
+        if with_n2000:
+            consensus_cost[n2k_mask_rs] = -1.0
+
+        try:
+            c_planner = AStarPlanner(
+                cost_grid=consensus_cost, max_turn_steps=1,
+                heuristic_weight=1.0, momentum=MOMENTUM,
+            )
+            consensus_result = c_planner.solve(
+                start=(sy_rs, sx_rs), goal=(ey_rs, ex_rs),
+                start_heading=None, goal_heading=None,
+            )
+        except Exception as exc:
+            print(f"    [warn] consensus A* failed: {exc}", flush=True)
+            consensus_result = None
+
+        heatmap[heatmap == 0] = np.nan   # non-visited → transparent
+        n_ok = len(routes)
+        if consensus_result:
+            print(f"    {n_ok}/{N} runs succeeded; consensus cost "
+                  f"{consensus_result.total_cost:.1f}", flush=True)
+        else:
+            print(f"    {n_ok}/{N} runs succeeded; consensus route not found",
+                  flush=True)
+        return heatmap, consensus_result
+
+    print("  Running sensitivity analysis (free) …", flush=True)
+    heatmap_free, consensus_free = _run_sensitivity(with_n2000=False)
+    print("  Running sensitivity analysis (N2000) …", flush=True)
+    heatmap_n2k,  consensus_n2k  = _run_sensitivity(with_n2000=True)
+
+    # ---- Compute shared heatmap vmax for better colormap gradient ---------------
+    _all_visits = np.concatenate([
+        heatmap_free[~np.isnan(heatmap_free)].ravel(),
+        heatmap_n2k[~np.isnan(heatmap_n2k)].ravel(),
+    ])
+    heat_vmax = max(1, int(np.percentile(_all_visits, 90))) if _all_visits.size > 0 else N
+
+    # ---- Optional NN fill of display bathymetry --------------------------------
+    if fill_nn:
+        print("  Filling bathymetry NaNs (nearest-neighbour, max_gap=1000) …",
+              flush=True)
+        bath.fill_nans_nn(max_gap=1000)
+
+    # ---- Downscale all display layers to match heatmap resolution (÷RESCALE) ---
+    # Everything is rendered at the rescaled grid — no upscaling artefacts.
+    bl     = bath.bl
+    extent = [bl[0], bl[0] + 80_000, bl[1], bl[1] + 35_000]
+
+    bath_ds  = ski.measure.block_reduce(bath.costs,    block_size=RESCALE, func=np.nanmean)
+    sw_prob  = np.clip(
+        ski.measure.block_reduce(
+            np.where(np.isnan(sw_cm.costs), 0.0, sw_cm.costs),
+            block_size=RESCALE, func=np.max),
+        0.0, 1.0)
+    var_flag = ski.measure.block_reduce(
+        ((~np.isnan(var_cm.costs)) & (var_cm.costs > VAR_THRESH)).astype(float),
+        block_size=RESCALE, func=np.max).astype(bool)
+    amp_flag = ski.measure.block_reduce(
+        ((~np.isnan(amp_cm.costs)) & (amp_cm.costs > AMP_THRESH)).astype(float),
+        block_size=RESCALE, func=np.max).astype(bool)
+    # n2k_mask_rs is already at rescaled resolution
+
+    shape = bath_ds.shape   # (rows//RESCALE, cols//RESCALE)
+
+    def _rgba(r, g, b, alpha_arr):
+        out = np.zeros((*shape, 4), dtype=float)
+        out[..., 0] = r
+        out[..., 1] = g
+        out[..., 2] = b
+        out[..., 3] = alpha_arr
+        return out
+
+    sw_rgba  = _rgba(0.84, 0.15, 0.16, sw_prob * SW_ALPHA)
+    var_rgba = _rgba(0.80, 0.10, 0.80, np.where(var_flag,    VAR_ALPHA, 0.0))
+    amp_rgba = _rgba(1.00, 0.75, 0.00, np.where(amp_flag,    AMP_ALPHA, 0.0))
+    n2k_rgba = _rgba(0.50, 0.50, 0.50, np.where(n2k_mask_rs, N2K_ALPHA, 0.0))
+
+    # ---- Rescaled-grid cell → UTM ----------------------------------------------
+    cell_m = 100 * RESCALE   # metres per rescaled cell
+
+    def _path_utm(result):
+        if result is None:
+            return None, None
+        xs = [bl[0] + col * cell_m + cell_m / 2 for _, col in result.coords]
+        ys = [bl[1] + row * cell_m + cell_m / 2 for row, _ in result.coords]
+        return xs, ys
+
+    # ---- Figure (2 rows × 1 col, identical layout to Fig 27) ------------------
+    cm_bath2 = copy.copy(CMAP_BATH)
+    cm_bath2.set_bad(NAN_COLOR)
+
+    fig, axes = plt.subplots(2, 1, figsize=(16, 13), constrained_layout=True)
+
+    configs = [
+        ("free", heatmap_free, consensus_free,
+         "Route frequency heatmap — unrestricted", False),
+        ("n2k",  heatmap_n2k,  consensus_n2k,
+         "Route frequency heatmap — N2000 zones excluded", True),
+    ]
+    im_bath = None
+    im_heat = None
+
+    for ax, (key, heatmap, cons_result, title, show_n2k) in zip(axes, configs):
+        # Bathymetry base (already downscaled to heatmap resolution)
+        bath_data = bath_ds if fill_nn else np.ma.masked_invalid(bath_ds)
+        im = ax.imshow(bath_data, cmap=cm_bath2, origin="lower", extent=extent,
+                       interpolation="nearest", aspect="equal", zorder=1)
+        if im_bath is None:
+            im_bath = im
+
+        # Risk overlays
+        for rgba in (sw_rgba, var_rgba, amp_rgba):
+            ax.imshow(rgba, origin="lower", extent=extent,
+                      interpolation="nearest", zorder=2)
+        if show_n2k and n2k_mask_rs.any():
+            ax.imshow(n2k_rgba, origin="lower", extent=extent,
+                      interpolation="nearest", zorder=3)
+
+        # Route-frequency heatmap (native rescaled resolution, no upscaling)
+        im_h = ax.imshow(
+            heatmap, cmap="YlOrRd", vmin=0, vmax=heat_vmax, alpha=HEAT_ALPHA,
+            origin="lower", extent=extent, interpolation="nearest", zorder=4,
+        )
+        if im_heat is None:
+            im_heat = im_h
+
+        # Reference routes
+        try:
+            import geopandas as gpd
+            for fpath, color, rlabel in zip(ROUTE_FILES, ROUTE_COLORS, ROUTE_LABELS):
+                if os.path.exists(fpath):
+                    gpd.read_file(fpath).to_crs(bath.csr).plot(
+                        ax=ax, color=color, linewidth=2.0, zorder=5)
+        except ImportError:
+            pass
+
+        # Consensus route
+        xs_c, ys_c = _path_utm(cons_result)
+        if xs_c is not None:
+            ax.plot(xs_c, ys_c, color=PATH_COLOR, lw=2.2,
+                    solid_capstyle="round", solid_joinstyle="round",
+                    path_effects=[withStroke(linewidth=4.5, foreground=PATH_EDGE)],
+                    zorder=7)
+
+        # Legend
+        sw_p   = Patch(facecolor=(0.84, 0.15, 0.16, SW_ALPHA), edgecolor="none",
+                       label="Sandwave detection  (prob. weighted)")
+        var_p  = Patch(facecolor=(0.80, 0.10, 0.80, VAR_ALPHA), edgecolor="none",
+                       label=f"High variance  (log-std > {VAR_THRESH})")
+        amp_p  = Patch(facecolor=(1.00, 0.75, 0.00, AMP_ALPHA), edgecolor="none",
+                       label=f"High amplitude  (> {AMP_THRESH} m)")
+        n2k_p  = Patch(facecolor=(0.50, 0.50, 0.50, N2K_ALPHA), edgecolor="none",
+                       label="N2000 exclusion zone  (impassable)")
+        heat_p = Patch(facecolor=plt.cm.YlOrRd(0.65), alpha=HEAT_ALPHA,
+                       edgecolor="none", label=f"Route frequency  (n = {N})")
+        cons_lbl = "Consensus route" if cons_result else "Consensus route (not found)"
+        cons_h = Line2D([0], [0], color=PATH_COLOR, lw=2.2,
+                        path_effects=[withStroke(linewidth=4.5, foreground=PATH_EDGE)],
+                        label=cons_lbl)
+        route_hdl = [Line2D([0], [0], color=c, lw=2, label=l)
+                     for c, l in zip(ROUTE_COLORS, ROUTE_LABELS)]
+
+        leg_handles = [cons_h, *route_hdl, heat_p, sw_p, var_p, amp_p]
+        if not fill_nn:
+            leg_handles.append(
+                Patch(facecolor=NAN_COLOR, edgecolor="none", label="No survey data"))
+        if show_n2k:
+            leg_handles.insert(1, n2k_p)
+        ax.legend(handles=leg_handles, loc="upper left",
+                  fontsize=FS - 4, frameon=True, edgecolor="#cccccc")
+
+        ax.set_title(title, fontsize=FS_TITLE, pad=7, fontweight="bold")
+        ax.set_xlabel("Easting  [m, UTM 31N]", fontsize=FS - 2)
+        ax.set_ylabel("Northing  [m, UTM 31N]", fontsize=FS - 2)
+        ax.set_xlim(extent[0], extent[1])
+        ax.set_ylim(extent[2], extent[3])
+        ax.locator_params(axis="x", nbins=6)
+        ax.locator_params(axis="y", nbins=6)
+        plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=FS - 3)
+        plt.setp(ax.get_yticklabels(), fontsize=FS - 3)
+
+    # Shared colorbars: depth (inner) + route frequency (outer)
+    if im_bath is not None:
+        cbar = fig.colorbar(im_bath, ax=axes.tolist(), shrink=0.75, pad=0.02)
+        cbar.set_label("Depth  [m]", fontsize=FS - 2)
+        cbar.ax.tick_params(labelsize=FS - 3)
+    if im_heat is not None:
+        cbar2 = fig.colorbar(im_heat, ax=axes.tolist(), shrink=0.75, pad=0.10)
+        cbar2.set_label(f"Route visits  (out of {N})", fontsize=FS - 2)
+        cbar2.ax.tick_params(labelsize=FS - 3)
+
+    fig.suptitle(
+        f"A* sensitivity analysis — route frequency  "
+        f"(n = {N},  \u03c3 = {SIGMA},  momentum = {MOMENTUM},  "
+        f"rescale \xd7{RESCALE},  100 m cells)",
+        fontsize=FS_TITLE + 1, fontweight="bold",
+    )
+    _save_or_show(fig, save_path)
+
+
+def plot_sensitivity_route_nn(save_path=None):
+    """Like plot_sensitivity_route but with NN-filled cost map and bathymetry."""
+    plot_sensitivity_route(save_path=save_path, fill_nn=True)
+
+
+# ---------------------------------------------------------------------------
+# Figure 11b — Angle-detection failure: cell 93 / CDI 3466117
+# ---------------------------------------------------------------------------
+
+_ANGLE_FAIL_PATH = "rasters/cell_93_CDI_3466117.npy"
+_ANGLE_FAIL_LABEL = "cell_93  ·  CDI 3466117\n(automatic angle detection failed — manual override required)"
+
+
+def plot_angle_detection_failure(save_path=None):
+    """
+    Five-panel diagnostic showing why automatic stripe-angle detection fails
+    for cell 93 / CDI 3466117.
+
+    Layout (2 rows):
+      Row 0 — three image panels:
+        Col 0 : Bathymetric survey data (NaN regions shown in grey).
+        Col 1 : Detrended residuals (Gaussian sigma = DETREND_SIGMA_CHOSEN).
+        Col 2 : Windowed + zero-padded FFT log-amplitude.
+      Row 1 — two line-plot panels:
+        Col 0+1 : Absolute notch-band response vs. rotation angle (0-179°).
+        Col 2+3 : Relative response (absolute minus local-neighbour mean, ±8°).
+                  The automatically selected peak is marked with a dashed line.
+    """
+    print("  Loading raster…", flush=True)
+    raw = np.load(_ANGLE_FAIL_PATH)
+    filled, mean_val, nan_mask = _fill_raster_path(_ANGLE_FAIL_PATH)
+
+    _, residuals = _gaussian_detrend(filled, DETREND_SIGMA_CHOSEN)
+
+    h, w     = residuals.shape
+    window   = np.outer(np.hanning(h), np.hanning(w))
+    eps      = 1e-2
+    win_clip = np.where(window < eps, eps, window)
+    pad      = max(h, w) // 2
+    win_padded = np.pad(residuals * win_clip, pad, mode="constant")
+    F_win      = np.fft.fftshift(np.fft.fft2(win_padded))
+    log_amp    = np.log(np.abs(F_win) + 1)
+
+    print("  Angle sweep…", flush=True)
+    auto_angle, resp, rel = _find_stripe_angle(log_amp)
+    print(f"  Auto-detected angle: {auto_angle:.0f}°", flush=True)
+    angles = np.arange(0, 180, 1)
+
+    # Build the detected-angle notch overlay (same as plot_angle_detection)
+    hp, wp = win_padded.shape
+    base   = np.zeros((hp, wp), dtype=float)
+    for i in range(-NOTCH_WIDTH_CHOSEN, NOTCH_WIDTH_CHOSEN + 1):
+        base += np.eye(hp, wp, k=i)
+    cy, cx = hp // 2, wp // 2
+    base[cy - NOTCH_CENTER_SIZE:cy + NOTCH_CENTER_SIZE,
+         cx - NOTCH_CENTER_SIZE:cx + NOTCH_CENTER_SIZE] = 0
+    base  = np.clip(base, 0, 1)
+    notch_rot = ndimage.rotate(base, float(auto_angle), reshape=False)
+    notch_rot = np.clip(notch_rot, 0, 1)
+
+    # ---- Layout: 2 rows, 4 logical columns (images share 1 unit, plots 1.5)
+    fig = plt.figure(figsize=(22, 11))
+    gs  = fig.add_gridspec(
+        2, 4,
+        width_ratios=[1, 1, 1.5, 1.5],
+        hspace=0.28, wspace=0.28,
+        left=0.07, right=0.98, top=0.90, bottom=0.09,
+    )
+
+    ax_data  = fig.add_subplot(gs[0, 0])
+    ax_res   = fig.add_subplot(gs[0, 1])
+    ax_fft   = fig.add_subplot(gs[0, 2:])     # FFT spans the two right columns
+    ax_abs   = fig.add_subplot(gs[1, 0:2])    # absolute response spans left cols
+    ax_rel   = fig.add_subplot(gs[1, 2:])     # relative response spans right cols
+
+    # Show raw data with NaN regions in grey
+    raw_disp = raw.copy()
+    cmap_data = plt.get_cmap("cmo.deep").copy()
+    cmap_data.set_bad(color="lightgrey")
+    vmin_d, vmax_d = float(np.nanpercentile(raw, 2)), float(np.nanpercentile(raw, 98))
+    im0 = ax_data.imshow(raw_disp, cmap=cmap_data, origin="upper",
+                         vmin=vmin_d, vmax=vmax_d)
+    cb0 = fig.colorbar(im0, ax=ax_data, fraction=0.046, pad=0.02)
+    cb0.set_label("Depth  [m]", fontsize=FS - 2)
+    cb0.ax.tick_params(labelsize=FS - 4)
+    ax_data.set_title("Bathymetric data\n(grey = no data)", fontsize=FS)
+
+    # Residuals panel
+    res_lim = float(np.nanpercentile(np.abs(residuals), 98))
+    im1 = ax_res.imshow(residuals + mean_val, cmap="cmo.deep", origin="upper",
+                        vmin=-res_lim + mean_val, vmax=res_lim + mean_val)
+    cb1 = fig.colorbar(im1, ax=ax_res, fraction=0.046, pad=0.02)
+    cb1.set_label("Residual  [m]", fontsize=FS - 2)
+    cb1.ax.tick_params(labelsize=FS - 4)
+    ax_res.set_title(f"Detrended residuals\n(Gaussian σ = {DETREND_SIGMA_CHOSEN} px)", fontsize=FS)
+
+    # FFT log-amplitude + notch overlay
+    fft_max = float(log_amp.max())
+    im2 = ax_fft.imshow(log_amp, cmap="hot", origin="upper", vmin=0, vmax=fft_max)
+    # Overlay notch in orange
+    notch_rgba              = np.zeros((*notch_rot.shape, 4), dtype=float)
+    notch_rgba[..., 0]      = 1.0          # R
+    notch_rgba[..., 1]      = 0.55         # G  -> orange
+    notch_rgba[..., 3]      = np.clip(notch_rot * 0.6, 0, 1)
+    ax_fft.imshow(notch_rgba, origin="upper")
+    cb2 = fig.colorbar(im2, ax=ax_fft, fraction=0.03, pad=0.02)
+    cb2.set_label("log |F|", fontsize=FS - 2)
+    cb2.ax.tick_params(labelsize=FS - 4)
+    ax_fft.set_title(
+        f"FFT log amplitude (windowed + zero-padded)\n"
+        f"orange band = notch at auto-detected angle {auto_angle:.0f}°",
+        fontsize=FS,
+    )
+    ax_fft.set_xlabel("Frequency (px)", fontsize=FS - 2)
+
+    # Absolute response vs angle
+    ax_abs.plot(angles, resp, color="steelblue", lw=1.5)
+    ax_abs.axvline(auto_angle, color=HIGHLIGHT_COLOR, lw=1.8, ls="--",
+                   label=f"Auto-detected: {auto_angle:.0f}°")
+    ax_abs.set_xlabel("Rotation angle  [°]", fontsize=FS - 1)
+    ax_abs.set_ylabel("Mean log |F| inside notch", fontsize=FS - 1)
+    ax_abs.set_title("Absolute notch-band response", fontsize=FS)
+    ax_abs.set_xlim(0, 179)
+    ax_abs.legend(fontsize=FS - 2)
+    ax_abs.grid(alpha=0.3)
+    ax_abs.tick_params(labelsize=FS - 3)
+
+    # Relative response vs angle
+    ax_rel.plot(angles, rel, color="steelblue", lw=1.5)
+    ax_rel.axvline(auto_angle, color=HIGHLIGHT_COLOR, lw=1.8, ls="--",
+                   label=f"Auto-detected: {auto_angle:.0f}°")
+    ax_rel.axhline(0, color="grey", lw=0.8, ls=":")
+    ax_rel.set_xlabel("Rotation angle  [°]", fontsize=FS - 1)
+    ax_rel.set_ylabel("Relative response  [a.u.]", fontsize=FS - 1)
+    ax_rel.set_title("Relative response (absolute − local-neighbour mean,  ±8°)", fontsize=FS)
+    ax_rel.set_xlim(0, 179)
+    ax_rel.legend(fontsize=FS - 2)
+    ax_rel.grid(alpha=0.3)
+    ax_rel.tick_params(labelsize=FS - 3)
+
+    fig.suptitle(_ANGLE_FAIL_LABEL, fontsize=FS + 1, fontweight="bold", y=0.97)
+
+    if save_path:
+        fig.savefig(save_path, dpi=300, bbox_inches="tight")
+        print(f"  Saved -> {save_path}", flush=True)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -1417,5 +4476,27 @@ if __name__ == "__main__":
     # plot_fft_preprocessing        (save_path=os.path.join(SAVE_DIR, "08_fft_preprocessing.png"))
     # plot_notch_width_comparison   (save_path=os.path.join(SAVE_DIR, "09_notch_width_comparison.png"))
     # plot_lowpass_notch_interaction(save_path=os.path.join(SAVE_DIR, "10_lowpass_notch_interaction.png"))
-    plot_angle_detection          (save_path=os.path.join(SAVE_DIR, "11_angle_detection.png"))
+    # plot_angle_detection          (save_path=os.path.join(SAVE_DIR, "11_angle_detection.png"))
+    # plot_angle_detection_failure  (save_path=os.path.join(SAVE_DIR, "11b_angle_detection_failure.png"))
+    # plot_windowed_vs_unwindowed_filtering(save_path=os.path.join(SAVE_DIR, "12_windowed_vs_unwindowed.png"))
+    # plot_swd_residuals        (save_path=os.path.join(SAVE_DIR, "13_swd_residuals.png"))
+    # plot_swd_local_std        (save_path=os.path.join(SAVE_DIR, "14_swd_local_std.png"))
+    # plot_swd_gradient_features(save_path=os.path.join(SAVE_DIR, "15_swd_gradient_features.png"))
+    # plot_swd_closing_effect      (save_path=os.path.join(SAVE_DIR, "20_swd_closing_effect.png"))
+    # plot_swd_erosion_effect      (save_path=os.path.join(SAVE_DIR, "21_swd_erosion_effect.png"))
+    # plot_swd_data_overview       (save_path=os.path.join(SAVE_DIR, "16_swd_data_overview.png"))
+    # plot_swd_label_pipeline      (save_path=os.path.join(SAVE_DIR, "17_swd_label_pipeline.png"))
+    # plot_swd_sigma_comparison    (save_path=os.path.join(SAVE_DIR, "18_swd_sigma_comparison.png"))
+    # plot_swd_threshold_morphology(save_path=os.path.join(SAVE_DIR, "19_swd_threshold_morphology.png"))
+    # plot_coverage_and_sandwaves(save_path=os.path.join(SAVE_DIR, "22_coverage_sandwaves.png"))
+    # plot_variance_costmap (save_path=os.path.join(SAVE_DIR, "23_variance_costmap.png"))
+    # plot_amplitude_costmap(save_path=os.path.join(SAVE_DIR, "24_amplitude_costmap.png"))
+    # plot_local_std_mask_cell56(save_path=os.path.join(SAVE_DIR, "25_local_std_mask_cell56.png"))
+    # plot_local_std_mask_cell39(save_path=os.path.join(SAVE_DIR, "25b_local_std_mask_cell39.png"))
+    # plot_combined_costmaps(save_path=os.path.join(SAVE_DIR, "26_combined_costmaps.png"))
+    # plot_optimised_route(save_path=os.path.join(SAVE_DIR, "27_optimised_route.png"))
+    # plot_optimised_route_nn(save_path=os.path.join(SAVE_DIR, "27b_optimised_route_nn.png"))
+    plot_sensitivity_route(save_path=os.path.join(SAVE_DIR, "28_sensitivity_route.png"))
+    plot_sensitivity_route_nn(save_path=os.path.join(SAVE_DIR, "28b_sensitivity_route_nn.png"))
+    # plot_angle_detection_failure(save_path=os.path.join(SAVE_DIR, "11b_angle_detection_failure.png"))
     print(f"\nAll plots saved to: {SAVE_DIR}/")

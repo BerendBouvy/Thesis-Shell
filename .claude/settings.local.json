@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(.venv/Scripts/python -c ' *)",
-      "Bash(.venv/Scripts/python.exe plots.py)"
+      "Bash(.venv/Scripts/python.exe plots.py)",
+      "Bash(pip list *)",
+      "Bash(py -3.11 -c \"import cmocean; print\\('ok'\\)\")"
     ]
   }
 }
