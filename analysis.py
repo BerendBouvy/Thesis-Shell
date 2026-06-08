@@ -208,10 +208,11 @@ def npraster_to_coordinates(raster, cell, cell_corners, cell_size=5000, cell_res
 
 if __name__ == "__main__":
     start = time.time()
-    aoi1 = aoi.AreaOfInterest("AOI.txt")
-    cell_corners = get_cell_corners(aoi1, cell_size=5000)
+    # aoi1 = aoi.AreaOfInterest("AOI.txt")
+    # cell_corners = get_cell_corners(aoi1, cell_size=5000)
     # plot_cells(aoi1, cell_corners, cell_size=5000, save_path="plots/aoi_cells.png")
-    analyse(cell_corners=cell_corners)
+    # analyse(cell_corners=cell_corners)
     # test()
+    
     end = time.time()
     print(f"Total execution time: {(end - start)/60:.2f} minutes")

@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(py -0)"
+      "Bash(py -0)",
+      "Bash(.venv/Scripts/python test_optimiser.py)"
     ]
   }
 }

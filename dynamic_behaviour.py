@@ -58,6 +58,64 @@ def main():
                         
                     
 
+def compute_difference_rasters(output_dir="difference_rasters/Rasters_diff"):
+    """Compute all pairwise signed difference rasters from the destriped rasters.
+
+    For each cell and every ordered pair of surveys (newer, older):
+      - difference  = raster_newer - raster_older
+      - demeaned    = difference - nanmean(difference)   (removes bulk offset)
+      - normalised  = demeaned / dt                      (m/yr, signed)
+
+    Files are written to `output_dir` as:
+      cell_{cell}_diff_{id_newer}_{id_older}.npy
+
+    Pairs with more than 80% NaN overlap are skipped.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    rasters = load_raster_files()
+    years   = get_years_dict(rasters)
+
+    n_saved = 0
+    for cell in rasters:
+        ids = list(rasters[cell].keys())
+        for i, id_a in enumerate(ids):
+            for id_b in ids[i + 1:]:
+                year_a = years[cell][id_a]
+                year_b = years[cell][id_b]
+                if year_a is None or year_b is None:
+                    continue
+
+                # Ensure id_newer / id_older ordering
+                if year_a >= year_b:
+                    id_newer, id_older = id_a, id_b
+                    year_newer, year_older = year_a, year_b
+                else:
+                    id_newer, id_older = id_b, id_a
+                    year_newer, year_older = year_b, year_a
+
+                dt = year_newer - year_older
+                if dt == 0:
+                    continue
+
+                r_new = rasters[cell][id_newer]
+                r_old = rasters[cell][id_older]
+
+                nan_ratio = np.isnan(r_new + r_old).sum() / r_new.size
+                if nan_ratio >= 0.8:
+                    continue
+
+                difference = r_new - r_old
+                demeaned   = difference - np.nanmean(difference)
+                normalised = demeaned / dt
+
+                fname = f"cell_{cell}_diff_{id_newer}_{id_older}.npy"
+                np.save(os.path.join(output_dir, fname), normalised)
+                n_saved += 1
+
+    print(f"Saved {n_saved} difference rasters to '{output_dir}'.")
+
+
 def plot_raster(raster, cmap, vmin, vmax, title, xlabel, ylabel, save_path):
     plt.imshow(raster, cmap=cmap, vmin=vmin, vmax=vmax)
     plt.colorbar(label="Difference in Bathymetry (m)")
@@ -103,6 +161,7 @@ def local_var(raster, size=10):
         
 if __name__ == "__main__":
     start = time.time()
-    main()
+    # main()
+    compute_difference_rasters()
     end = time.time()
     print(f"Execution time: {end - start:.2f} seconds")

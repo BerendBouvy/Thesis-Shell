@@ -6,10 +6,11 @@ import skimage as ski
 import os
 import numpy as np
 import time
+import tqdm
 
 rasters_path = "sandwave_detection_v8/labels"
-animate = False
-n2000 = False
+animate = True
+n2000 = True
 if n2000:
     ref_plot = 1
 else:   
@@ -142,7 +143,7 @@ def run():
     costmap.plot_cost_map(cmap='Greens', show=True, show_routes=True)
     costmap.fill_nans_high_cost()
     costmap.plot_cost_map(cmap='Blues', show=True, show_routes=True, save_path="cmap.png")
-    return
+
     rescale_factor = 1
     # cmap_rescaled = ski.measure.block_reduce(
     #     costmap.costs,
@@ -167,15 +168,15 @@ def run():
     result, record = planner.solve_with_recording(
         start=(start_y_idx, start_x_idx),  # Note the order (y, x) for grid indexing
         goal=(end_y_idx, end_x_idx),
-        start_heading=0,
-        goal_heading=6
+        start_heading=None,
+        goal_heading=None
     )
 
     if result is not None:
         print(result)
         print(f"Nodes expanded: {len(record.expansions)}")
         if animate:
-            record.animate(step=2000, interval=100, route=costmap.routes[ref_plot], save_gif="gifs/astar_pathfinding.gif") 
+            record.animate(step=20000, interval=100, route=costmap.routes[ref_plot], save_gif=f"gifs/astar_pathfinding_{time.time()}.gif") 
         else:
             result.plot_path(show=True, route=costmap.routes[ref_plot])
 
@@ -853,6 +854,256 @@ def add_noise(arr, sigma):
     return np.where((~np.isnan(arr)) & (arr != 0), noisy, arr)
 
 
+def _fill_nans_nn_array(arr):
+    """Return copy of arr with NaN values filled via nearest-neighbour interpolation."""
+    from scipy.ndimage import distance_transform_edt
+    mask = np.isnan(arr)
+    if not mask.any() or mask.all():
+        return arr.copy()
+    out = arr.copy()
+    _, idx = distance_transform_edt(mask, return_indices=True)
+    out[mask] = arr[idx[0][mask], idx[1][mask]]
+    return out
+
+
+def _route_cost_on_grid(coords, cost_grid):
+    """Compute A*-style cost (Σ dist × cell_cost) for an ordered (row, col) sequence."""
+    total = 0.0
+    for i in range(len(coords) - 1):
+        r0, c0 = coords[i]
+        r1, c1 = coords[i + 1]
+        dist = np.sqrt((r1 - r0) ** 2 + (c1 - c0) ** 2)
+        c = cost_grid[r1, c1]
+        if np.isfinite(c) and c > 0:
+            total += dist * c
+    return total
+
+
+def _route_length_km(coords, cell_size_m):
+    """Compute physical path length in km for an ordered (row, col) sequence."""
+    total = 0.0
+    for i in range(len(coords) - 1):
+        r0, c0 = coords[i]
+        r1, c1 = coords[i + 1]
+        total += np.sqrt((r1 - r0) ** 2 + (c1 - c0) ** 2)
+    return total * cell_size_m / 1000.0
+
+
+def _trace_skeleton_bfs(skeleton, start_yx, end_yx):
+    """BFS through skeleton from start_yx to end_yx (snaps to nearest skeleton pixel).
+
+    Returns ordered list of (row, col) coords, or None if unreachable.
+    """
+    from collections import deque
+    rows, cols = skeleton.shape
+    sk_rows, sk_cols = np.where(skeleton)
+    if len(sk_rows) == 0:
+        return None
+
+    def snap(yx):
+        r, c = yx
+        dists = (sk_rows - r) ** 2 + (sk_cols - c) ** 2
+        i = int(np.argmin(dists))
+        return int(sk_rows[i]), int(sk_cols[i])
+
+    s, e = snap(start_yx), snap(end_yx)
+    if s == e:
+        return [s]
+
+    visited = {s: None}
+    queue = deque([s])
+    found = False
+    while queue:
+        r, c = queue.popleft()
+        if (r, c) == e:
+            found = True
+            break
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if dr == 0 and dc == 0:
+                    continue
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < rows and 0 <= nc < cols and skeleton[nr, nc] and (nr, nc) not in visited:
+                    visited[(nr, nc)] = (r, c)
+                    queue.append((nr, nc))
+
+    if not found:
+        return None
+    path = []
+    node = e
+    while node is not None:
+        path.append(node)
+        node = visited[node]
+    path.reverse()
+    return path
+
+
+def run_sensitivity_analysis_comparison():
+    """Sensitivity analysis for both N2000 scenarios with NN NaN interpolation.
+
+    For each scenario (with / without N2000) reports:
+    - Consensus route cost evaluated on the base (non-noisy) cost grid
+    - Proposed route 1 and route 2 costs on the same base grid
+    - Relative cost reduction of the consensus route vs each proposed route
+
+    Settings match run_sensitivity_analysis: n=100, rescale_factor=4, momentum=2.
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    n               = 100
+    sigma           = 0.5
+    var_threshold   = 0.05
+    amp_threshold   = 0.08
+    rescale_factor  = 4
+    momentum        = 2
+
+    print("Loading data layers …", flush=True)
+    nanmap       = nan_map()
+    base1        = build_sandwave_costmap().costs
+    base2_thresh = np.where(build_variance_costmap().costs > var_threshold, 1.0, np.nan)
+    base3_thresh = np.where(build_amplitude_costmap().costs > amp_threshold, 1.0, np.nan)
+    shape        = base1.shape
+
+    template = cm.CostMap(dx=100, dy=100, default_cost=1)
+    template.set_nans(nanmap)
+    nan_mask = np.isnan(template.costs)
+
+    start_x, start_y = template.start_utm
+    end_x,   end_y   = template.end_utm
+    sx = template.get_idx_from_coordinates(start_x, start_y)[0] // rescale_factor
+    sy = template.get_idx_from_coordinates(start_x, start_y)[1] // rescale_factor
+    ex = template.get_idx_from_coordinates(end_x,   end_y)[0]   // rescale_factor
+    ey = template.get_idx_from_coordinates(end_x,   end_y)[1]   // rescale_factor
+    start_yx, end_yx = (sy, sx), (ey, ex)
+
+    # Pre-compute NN fill indices (NaN pattern is constant across iterations)
+    _, nn_idx = distance_transform_edt(nan_mask, return_indices=True)
+    nn_rows = nn_idx[0][nan_mask]
+    nn_cols = nn_idx[1][nan_mask]
+
+    if rescale_factor > 1:
+        rescaled_nan_mask = ski.measure.block_reduce(
+            nan_mask.astype(float), block_size=rescale_factor, func=np.max
+        ).astype(bool)
+    else:
+        rescaled_nan_mask = nan_mask
+
+    results = {}
+
+    for use_n2000 in [True, False]:
+        label = "with N2000" if use_n2000 else "without N2000"
+        print(f"\n{'='*60}\n  Scenario: {label}\n{'='*60}", flush=True)
+
+        # ── Base (non-noisy) cost grid for cost evaluation ─────────────────
+        base_combined = cm.nansum([np.ones(shape), base1, base2_thresh, base3_thresh], axis=0)
+        base_combined[nan_mask] = np.nan
+        base_combined = _fill_nans_nn_array(base_combined)
+        if use_n2000:
+            base_combined = template.block_n2000(array=base_combined)
+        if rescale_factor > 1:
+            base_grid_rs = ski.measure.block_reduce(
+                base_combined, block_size=rescale_factor, func=np.nanmax
+            )
+        else:
+            base_grid_rs = base_combined.copy()
+
+        rescaled_shape = base_grid_rs.shape
+
+        # ── Proposed route costs and lengths on base grid ─────────────────
+        cell_size_m = 100 * rescale_factor   # physical size of one rescaled cell
+        print("  Computing proposed route costs …", flush=True)
+        proposed_costs  = []
+        proposed_lengths = []
+        for ri, route_skeleton in enumerate(template.routes):
+            if rescale_factor > 1:
+                rs_route = (ski.measure.block_reduce(
+                    route_skeleton.astype(float), block_size=rescale_factor, func=np.max
+                ) > 0)
+            else:
+                rs_route = route_skeleton.astype(bool)
+
+            path = _trace_skeleton_bfs(rs_route, start_yx, end_yx)
+            if path is not None:
+                cost   = _route_cost_on_grid(path, base_grid_rs)
+                length = _route_length_km(path, cell_size_m)
+                print(f"    Proposed route {ri + 1}: cost {cost:.2f},  length {length:.1f} km")
+            else:
+                cost, length = np.nan, np.nan
+                print(f"    Proposed route {ri + 1}: skeleton unreachable from start to end")
+            proposed_costs.append(cost)
+            proposed_lengths.append(length)
+
+        # ── n sensitivity iterations ───────────────────────────────────────
+        print(f"  Running {n} sensitivity iterations …", flush=True)
+        routes = []
+        for _ in tqdm.tqdm(range(n)):
+            combined = cm.nansum(
+                [add_noise(np.ones(shape), sigma),
+                 add_noise(base1, sigma),
+                 add_noise(base2_thresh, sigma),
+                 add_noise(base3_thresh, sigma)],
+                axis=0,
+            )
+            # NN fill: reuse pre-computed indices (NaN locations don't change)
+            combined[nan_mask] = combined[nn_rows, nn_cols]
+            if use_n2000:
+                combined = template.block_n2000(array=combined)
+            if rescale_factor > 1:
+                combined = ski.measure.block_reduce(
+                    combined, block_size=rescale_factor, func=np.nanmax
+                )
+
+            result = AStarPlanner(
+                cost_grid=combined, max_turn_steps=1,
+                heuristic_weight=1, momentum=momentum,
+            ).solve(start=start_yx, goal=end_yx, start_heading=0, goal_heading=6)
+
+            if result is not None:
+                routes.append(result)
+
+        print(f"  {len(routes)}/{n} successful routes", flush=True)
+
+        # ── Consensus route ────────────────────────────────────────────────
+        heatmap = np.zeros(rescaled_shape)
+        for route in routes:
+            heatmap += route.get_numpy_path()
+        heatmap_filled = np.where(np.isnan(heatmap), 0, heatmap)
+        freq_grid = (n + 1) / (heatmap_filled + 1)
+        freq_grid[rescaled_nan_mask] = np.nanmax(freq_grid)
+
+        consensus_result = AStarPlanner(
+            cost_grid=freq_grid, max_turn_steps=1,
+            heuristic_weight=1.0, momentum=momentum,
+        ).solve(start=start_yx, goal=end_yx, start_heading=0, goal_heading=6)
+
+        if consensus_result is not None:
+            consensus_cost   = _route_cost_on_grid(consensus_result.coords, base_grid_rs)
+            consensus_length = _route_length_km(consensus_result.coords, cell_size_m)
+        else:
+            consensus_cost, consensus_length = np.nan, np.nan
+            print("  Warning: consensus route not found")
+
+        # ── Print comparison ───────────────────────────────────────────────
+        print(f"\n  -- Results ({label}) --")
+        print(f"  Consensus route  : cost {consensus_cost:.2f},  length {consensus_length:.1f} km")
+        for ri, (pcost, plength) in enumerate(zip(proposed_costs, proposed_lengths)):
+            print(f"  Proposed route {ri + 1}  : cost {pcost:.2f},  length {plength:.1f} km")
+            if np.isfinite(pcost) and np.isfinite(consensus_cost) and pcost > 0:
+                reduction = (pcost - consensus_cost) / pcost * 100
+                print(f"  Cost reduction vs route {ri + 1}: {reduction:.1f}%")
+
+        results[label] = {
+            'consensus_cost':    consensus_cost,
+            'consensus_length':  consensus_length,
+            'proposed_costs':    proposed_costs,
+            'proposed_lengths':  proposed_lengths,
+            'n_routes_found':    len(routes),
+        }
+
+    print("\n=== Comparison complete ===")
+    return results
+
+
 def combine_rasters(rasters, func=np.nanmean):
     """Combine multiple rasters using a specified function while ignoring NaN values."""
     stacked = np.stack(rasters, axis=0)
@@ -863,7 +1114,8 @@ def combine_rasters(rasters, func=np.nanmean):
 if __name__ == "__main__":
     start = time.time()
     # run()
-    run_sensitivity_analysis()
+    # run_sensitivity_analysis()
+    run_sensitivity_analysis_comparison()
     # plot_nan_map_with_cells()
     # plot_turn_rules(momentum=4, staircase_width=3, n_cycles=3)
     # plot_bend_radius(momentum_values=[1, 2, 4, 8], cell_size=100)

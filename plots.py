@@ -384,7 +384,7 @@ def plot_smooth_comparison(save_path=None):
 
     finals = [_smooth_iters(blended, raster_dm, sigma=s, n_iter=3) for s in sigmas]
 
-    best_row = _best_cross_section_row(nan_mask)
+    best_row = raster_dm.shape[0] // 2
 
     # ---- layout ----
     fig = plt.figure(figsize=(20, 9))
@@ -2427,58 +2427,76 @@ def plot_swd_data_overview(save_path=None):
 def plot_swd_label_pipeline(save_path=None):
     """
     Six-panel step-by-step illustration of clean_smoothed_labels at chosen params.
+    Uses cell 24 / CDI 2174760, which has visible changes at every cleaning step
+    (43 px added by closing, 898 px added by fill_holes, 148 px removed as small islands).
 
     Panels (left → right):
       1 Raw K-Means labels
       2 Gaussian-smoothed probability map  (σ = 20 px)
       3 After threshold  t = 0.35
-      4 After binary closing  (2 iter, 3×3)
-      5 After fill_holes
-      6 After removing small islands  (< 200 px)
+      4 After binary closing  (2 iter, 3×3)   — green overlay = newly added pixels
+      5 After fill_holes                       — green overlay = newly filled pixels
+      6 After removing small islands (<200 px) — blue  overlay = removed pixels
 
     The threshold value is marked as a vertical line on the smoothed-map colorbar.
     """
     from matplotlib.patches import Patch
 
+    PIPE_CELL = 24
+    PIPE_CDI  = 2174760
+    raster_path     = f"destriped_rasters/cell_{PIPE_CELL}_CDI_{PIPE_CDI}_destriped.npy"
+    raw_labels_path = (f"sandwave_detection_v8/labels/"
+                       f"cell_{PIPE_CELL}_CDI_{PIPE_CDI}_destriped_labels.npy")
+
     print("  Loading sandwave labels …", flush=True)
-    _, _, nan_mask = _load_swd()
-    valid_mask  = ~nan_mask
-    labels_raw  = _load_swd_raw_labels()
-    labels_bin  = np.where(labels_raw < 0, 0, labels_raw)
+    raster     = np.load(raster_path)
+    nan_mask   = np.isnan(raster)
+    valid_mask = ~nan_mask
+    labels_raw = np.load(raw_labels_path)
+    labels_bin = np.where(labels_raw < 0, 0, labels_raw)
 
     steps = _clean_steps(labels_bin, valid_mask,
                          sigma=SWD_CLEAN_SIGMA, threshold=SWD_CLEAN_THRESH,
                          closing_iter=SWD_CLOSING_ITER, min_pixels=SWD_MIN_PIXELS)
+
+    thr   = steps["after_threshold"]
+    clos  = steps["after_closing"]
+    fill  = steps["after_fillholes"]
+    final = steps["final"]
+
+    add_closing   = (clos == 1) & (thr  != 1)   # pixels added by closing
+    add_fillholes = (fill == 1) & (clos != 1)   # pixels added by fill_holes
+    rem_final     = (fill == 1) & (final != 1)  # pixels removed by small-island filter
 
     cmap_lab, norm_lab = _labels_cmap_norm()
     cm_smooth = copy.copy(plt.colormaps["YlOrRd"]); cm_smooth.set_bad(NAN_COLOR)
 
     panels = [
         ("Raw K-Means labels",
-         labels_raw,
-         cmap_lab, norm_lab, None, None),
+         labels_raw, cmap_lab, norm_lab, None, None),
         (f"Gaussian smoothing\n(σ = {SWD_CLEAN_SIGMA} px)",
-         steps["smoothed_float"],
-         cm_smooth, None, 0.0, 1.0),
+         steps["smoothed_float"], cm_smooth, None, 0.0, 1.0),
         (f"Threshold  t = {SWD_CLEAN_THRESH}",
-         steps["after_threshold"],
-         cmap_lab, norm_lab, None, None),
+         thr, cmap_lab, norm_lab, None, None),
         (f"Binary closing\n({SWD_CLOSING_ITER} iter, 3×3)",
-         steps["after_closing"],
-         cmap_lab, norm_lab, None, None),
+         clos, cmap_lab, norm_lab, None, None),
         ("Fill holes",
-         steps["after_fillholes"],
-         cmap_lab, norm_lab, None, None),
+         fill, cmap_lab, norm_lab, None, None),
         (f"Remove small islands\n(< {SWD_MIN_PIXELS} px)",
-         steps["final"],
-         cmap_lab, norm_lab, None, None),
+         final, cmap_lab, norm_lab, None, None),
     ]
+
+    # RGBA overlays: green = added, blue = removed
+    _green = [0.00, 0.80, 0.20, 0.88]
+    _blue  = [0.08, 0.39, 0.75, 0.88]
+    change_overlays = [None, None, None, (add_closing, _green), (add_fillholes, _green), (rem_final, _blue)]
 
     fig, axes = plt.subplots(1, 6, figsize=(22, 5))
     fig.subplots_adjust(wspace=0.05, left=0.02, right=0.97, top=0.84, bottom=0.17)
 
     im_smooth = None
-    for c, (title, data, cmap, norm, vmin, vmax) in enumerate(panels):
+    for c, ((title, data, cmap, norm, vmin, vmax), overlay) in enumerate(
+            zip(panels, change_overlays)):
         ax = axes[c]
         if vmin is not None:
             im = ax.imshow(np.ma.masked_invalid(data), cmap=cmap, origin="upper",
@@ -2486,6 +2504,13 @@ def plot_swd_label_pipeline(save_path=None):
             im_smooth = im
         else:
             im = ax.imshow(data, cmap=cmap, norm=norm, origin="upper")
+
+        if overlay is not None:
+            mask, rgba = overlay
+            ov = np.zeros((*mask.shape, 4), dtype=float)
+            ov[mask] = rgba
+            ax.imshow(ov, origin="upper")
+
         ax.set_title(title, fontsize=FS_TITLE, pad=6)
         ax.set_xticks([]); ax.set_yticks([])
 
@@ -2511,12 +2536,15 @@ def plot_swd_label_pipeline(save_path=None):
     # Legend
     leg = [Patch(facecolor="white",   edgecolor="#aaaaaa", label="flat seabed (0)"),
            Patch(facecolor="#e53935", label="sandwave (1)"),
-           Patch(facecolor=NAN_COLOR, label="no data (−1)")]
+           Patch(facecolor=NAN_COLOR, label="no data (−1)"),
+           Patch(facecolor="#00cc33", label="added by step"),
+           Patch(facecolor="#1465c0", label="removed by step")]
     axes[-1].legend(handles=leg, fontsize=FS - 3, loc="lower right",
                     framealpha=0.85, edgecolor="#aaaaaa")
 
     fig.suptitle(
-        "Label cleaning pipeline: raw K-Means → smoothed binary classification",
+        f"Label cleaning pipeline: raw K-Means → smoothed binary classification"
+        f"  (cell {PIPE_CELL}, CDI {PIPE_CDI})",
         fontsize=FS_TITLE + 1, fontweight="bold", y=0.97)
 
     _save_or_show(fig, save_path)
@@ -4318,6 +4346,339 @@ def plot_sensitivity_route_nn(save_path=None):
 
 
 # ---------------------------------------------------------------------------
+# Cover art — A4 portrait, both scenarios, full-res + bilinear rendering
+# ---------------------------------------------------------------------------
+
+def plot_cover_art(save_path=None):
+    """
+    Thesis cover art based on Fig 28b — A4 portrait with both scenarios stacked.
+
+    Quality improvements over the regular figure:
+      - Background layers at full 100 m resolution (350x800) rather than the
+        4x rescaled 400 m grid, giving 4x more spatial detail.
+      - Heatmap upsampled from the rescaled grid to full resolution with bilinear
+        zoom so there are no visible square pixels.
+      - All imshow calls use interpolation="bilinear" for smooth rendering.
+      - Heatmap alpha is proportional to sqrt(frequency) so unvisited cells fade
+        out gracefully.
+    """
+    import skimage as ski
+    import costmap as cm_mod
+    from Astar import AStarPlanner
+    from matplotlib.patheffects import withStroke
+
+    N          = 100
+    SIGMA      = 0.5
+    VAR_THRESH = 0.05
+    AMP_THRESH = 0.08
+    RESCALE    = 4
+    MOMENTUM   = 2
+
+    LABELS_DIR = "sandwave_detection_v8/labels"
+    VAR_DIR    = "variance_rasters/Rasters"
+    AMP_DIR    = "amplitude_rasters/Rasters_amp"
+    N2K_SHP    = "shapes/n200.shp"
+
+    SW_ALPHA   = 0.45
+    VAR_ALPHA  = 0.40
+    AMP_ALPHA  = 0.45
+    N2K_ALPHA  = 0.60
+    HEAT_ALPHA = 0.70
+
+    ROUTE_FILES  = ["shapes/line1.shp", "shapes/line2.shp"]
+    ROUTE_COLORS = ["#aeea00", "#ff7f0e"]
+    PATH_COLOR   = "white"
+    PATH_EDGE    = "#111111"
+
+    def _load_dir(directory, suffix=None):
+        d = {}
+        for fname in os.listdir(directory):
+            if suffix and not fname.endswith(suffix):
+                continue
+            cid = fname.split("_")[1]
+            arr = np.load(os.path.join(directory, fname))[::-1, :]
+            d.setdefault(cid, []).append(arr)
+        return d
+
+    def _combine(rasters, func=np.nanmean):
+        stacked = np.stack(rasters, axis=0)
+        with np.errstate(invalid="ignore"):
+            return func(stacked, axis=0)
+
+    def _add_noise(arr, sigma):
+        noisy = arr + np.random.normal(0, sigma, arr.shape)
+        return np.where((~np.isnan(arr)) & (arr != 0), noisy, arr)
+
+    # ---- Load data layers -------------------------------------------------------
+    print("  Building bathymetry …", flush=True)
+    bath = cm_mod.CostMap(dx=100, dy=100, default_cost=np.nan)
+    for cid, rasters in _load_dir("destriped_rasters").items():
+        avg = _combine(rasters, np.nanmean)
+        rs  = ski.measure.block_reduce(avg, block_size=5, func=np.nanmean)
+        xs, xe, ys, ye = bath.slice_cost_map(int(cid))
+        bath.add_cost(xs, ys, cost=rs, x_idx_end=xe, y_idx_end=ye)
+
+    print("  Loading sandwave labels …", flush=True)
+    sw_cm = cm_mod.CostMap(dx=100, dy=100, default_cost=np.nan)
+    for cid, rasters in _load_dir(LABELS_DIR,
+                                   suffix="destriped_labels_smoothed.npy").items():
+        rasters = [r.astype(float) for r in rasters]
+        for r in rasters:
+            r[r == -1] = np.nan
+        avg = _combine(rasters, np.nanmean)
+        rs  = ski.measure.block_reduce(avg, block_size=5, func=np.max)
+        xs, xe, ys, ye = sw_cm.slice_cost_map(int(cid))
+        sw_cm.add_cost(xs, ys, cost=rs, x_idx_end=xe, y_idx_end=ye)
+
+    print("  Loading variance …", flush=True)
+    var_cm = cm_mod.CostMap(dx=100, dy=100, default_cost=np.nan)
+    for cid, rasters in _load_dir(VAR_DIR).items():
+        avg = _combine(rasters, np.nanmean)
+        rs  = ski.measure.block_reduce(avg, block_size=5, func=np.nanmean)
+        ts  = np.log10(np.sqrt(np.maximum(rs, 0.0)) + 1.0)
+        xs, xe, ys, ye = var_cm.slice_cost_map(int(cid))
+        var_cm.add_cost(xs, ys, cost=ts, x_idx_end=xe, y_idx_end=ye)
+
+    print("  Loading amplitude …", flush=True)
+    amp_cm = cm_mod.CostMap(dx=100, dy=100, default_cost=np.nan)
+    for cid, rasters in _load_dir(AMP_DIR).items():
+        avg = _combine(rasters, np.nanmax)
+        rs  = ski.measure.block_reduce(avg, block_size=5, func=np.nanmax)
+        xs, xe, ys, ye = amp_cm.slice_cost_map(int(cid))
+        amp_cm.add_cost(xs, ys, cost=rs, x_idx_end=xe, y_idx_end=ye)
+
+    full_shape    = bath.costs.shape
+    nan_mask_full = np.isnan(bath.costs)
+
+    sw_base         = sw_cm.costs.copy()
+    var_base_thresh = np.where(
+        (~np.isnan(var_cm.costs)) & (var_cm.costs > VAR_THRESH), 1.0, np.nan)
+    amp_base_thresh = np.where(
+        (~np.isnan(amp_cm.costs)) & (amp_cm.costs > AMP_THRESH), 1.0, np.nan)
+
+    # N2000 mask
+    n2k_mask = np.zeros(full_shape, dtype=bool)
+    try:
+        arr = np.zeros(full_shape, dtype=float)
+        cm_mod.CostMap(dx=100, dy=100, default_cost=0.0).block_n2000(
+            array=arr, path=N2K_SHP)
+        n2k_mask = (arr == -1)
+    except Exception as exc:
+        print(f"  [warn] N2000 mask: {exc}", flush=True)
+
+    # Start / goal
+    ref_cm = cm_mod.CostMap(dx=100, dy=100, default_cost=1)
+    sx, sy = ref_cm.start_utm
+    ex, ey = ref_cm.end_utm
+    sx_idx, sy_idx = ref_cm.get_idx_from_coordinates(sx, sy)
+    ex_idx, ey_idx = ref_cm.get_idx_from_coordinates(ex, ey)
+    sx_rs, sy_rs = sx_idx // RESCALE, sy_idx // RESCALE
+    ex_rs, ey_rs = ex_idx // RESCALE, ey_idx // RESCALE
+
+    nan_mask_rs = ski.measure.block_reduce(
+        nan_mask_full.astype(float), block_size=RESCALE, func=np.max).astype(bool)
+    n2k_mask_rs = ski.measure.block_reduce(
+        n2k_mask.astype(float), block_size=RESCALE, func=np.max).astype(bool)
+
+    # Precompute NN fill for SMALL NaN holes only (max 1000 px).
+    # Large no-data regions stay impassable (filled with max cost, not NN).
+    # This matches the original plot_sensitivity_route fill_nn=True logic.
+    from scipy.ndimage import zoom as _zoom
+    from scipy.ndimage import label as _label
+    from scipy.spatial import cKDTree as _cKDTree
+
+    _ri, _ci = np.indices(full_shape)
+    _valid_pos = np.column_stack([_ri[~nan_mask_full], _ci[~nan_mask_full]])
+    _tree = _cKDTree(_valid_pos)
+    _labeled, _n_comp = _label(nan_mask_full)
+    _sizes = np.bincount(_labeled.ravel())
+    _fill_mask = np.zeros_like(nan_mask_full, dtype=bool)
+    for _i in range(1, _n_comp + 1):
+        if _sizes[_i] <= 1000:
+            _fill_mask |= (_labeled == _i)
+    _fill_pos = np.column_stack([_ri[_fill_mask], _ci[_fill_mask]])
+    _, _nn_idx_small = _tree.query(_fill_pos)
+    del _ri, _ci, _labeled, _tree   # free memory
+
+    # ---- Sensitivity analysis (both scenarios) ---------------------------------
+    def _run_sensitivity(with_n2000):
+        routes = []
+        for i in range(N):
+            if (i + 1) % 20 == 0:
+                print(f"    iteration {i + 1}/{N}", flush=True)
+            c1 = _add_noise(sw_base, SIGMA)
+            c2 = _add_noise(var_base_thresh, SIGMA)
+            c3 = _add_noise(amp_base_thresh, SIGMA)
+            cb = _add_noise(np.ones(full_shape), SIGMA)
+
+            combined = cm_mod.nansum([cb, c1, c2, c3], axis=0)
+            combined[nan_mask_full] = np.nan
+            # Small holes: NN-fill from nearest valid neighbour
+            valid_vals = combined[~nan_mask_full]
+            combined[_fill_mask] = valid_vals[_nn_idx_small]
+            # Large holes: high cost (impassable after rescale → NaN → A* skips)
+            remaining = np.isnan(combined)
+            if remaining.any():
+                combined[remaining] = float(np.nanmax(combined[~remaining]))
+            if with_n2000:
+                combined[n2k_mask] = -1.0
+            if RESCALE > 1:
+                combined = ski.measure.block_reduce(
+                    combined, block_size=RESCALE, func=np.nanmax)
+
+            planner = AStarPlanner(
+                cost_grid=combined, max_turn_steps=1,
+                heuristic_weight=1.0, momentum=MOMENTUM,
+            )
+            try:
+                result = planner.solve(
+                    start=(sy_rs, sx_rs), goal=(ey_rs, ex_rs),
+                    start_heading=None, goal_heading=None,
+                )
+            except Exception:
+                result = None
+            if result is not None:
+                routes.append(result)
+
+        rs_shape = routes[0].get_numpy_path().shape if routes else nan_mask_rs.shape
+        heatmap  = np.zeros(rs_shape)
+        for route in routes:
+            heatmap += route.get_numpy_path()
+
+        heatmap_f      = np.where(heatmap == 0, 0.0, heatmap)
+        consensus_cost = (N + 1) / (heatmap_f + 1)
+        consensus_cost[nan_mask_rs] = float(np.nanmax(consensus_cost))
+        if with_n2000:
+            consensus_cost[n2k_mask_rs] = -1.0
+
+        try:
+            c_planner = AStarPlanner(
+                cost_grid=consensus_cost, max_turn_steps=1,
+                heuristic_weight=1.0, momentum=MOMENTUM,
+            )
+            consensus_result = c_planner.solve(
+                start=(sy_rs, sx_rs), goal=(ey_rs, ex_rs),
+                start_heading=None, goal_heading=None,
+            )
+        except Exception as exc:
+            print(f"    [warn] consensus A* failed: {exc}", flush=True)
+            consensus_result = None
+
+        heatmap[heatmap == 0] = np.nan
+        print(f"    {len(routes)}/{N} runs succeeded", flush=True)
+        return heatmap, consensus_result
+
+    print("  Running sensitivity analysis (free) …", flush=True)
+    heatmap_free, consensus_free = _run_sensitivity(False)
+    print("  Running sensitivity analysis (N2000) …", flush=True)
+    heatmap_n2k,  consensus_n2k  = _run_sensitivity(True)
+
+    # ---- NN-fill bathymetry; use full 100 m resolution for display -------------
+    bath.fill_nans_nn(max_gap=1000)
+    bath_full = bath.costs   # (350, 800)
+
+    bl     = bath.bl
+    extent = [bl[0], bl[0] + 80_000, bl[1], bl[1] + 35_000]
+    cell_m = 100 * RESCALE
+
+    # Full-resolution overlays (no block_reduce) — 4× sharper than before
+    sw_prob_full  = np.clip(np.where(np.isnan(sw_cm.costs), 0.0, sw_cm.costs), 0.0, 1.0)
+    var_flag_full = (~np.isnan(var_cm.costs)) & (var_cm.costs > VAR_THRESH)
+    amp_flag_full = (~np.isnan(amp_cm.costs)) & (amp_cm.costs > AMP_THRESH)
+
+    def _rgba_full(r, g, b, alpha_arr):
+        out = np.zeros((*full_shape, 4), dtype=float)
+        out[..., 0] = r; out[..., 1] = g; out[..., 2] = b; out[..., 3] = alpha_arr
+        return out
+
+    sw_rgba  = _rgba_full(0.84, 0.15, 0.16, sw_prob_full * SW_ALPHA)
+    var_rgba = _rgba_full(0.80, 0.10, 0.80, np.where(var_flag_full, VAR_ALPHA, 0.0))
+    amp_rgba = _rgba_full(1.00, 0.75, 0.00, np.where(amp_flag_full, AMP_ALPHA, 0.0))
+    n2k_rgba = _rgba_full(0.50, 0.50, 0.50, np.where(n2k_mask,      N2K_ALPHA, 0.0))
+
+    # Upsample heatmaps from RESCALE grid to full res; alpha fades with frequency
+    def _heatmap_rgba(hm):
+        hm_nonan = np.where(np.isnan(hm), 0.0, hm)
+        zr = full_shape[0] / hm.shape[0]
+        zc = full_shape[1] / hm.shape[1]
+        hm_up    = _zoom(hm_nonan, (zr, zc), order=1)
+        _visits  = hm_nonan[hm_nonan > 0]
+        vmax     = max(1, int(np.percentile(_visits, 90))) if _visits.size else 1
+        norm_hm  = np.clip(hm_up / vmax, 0.0, 1.0)
+        rgba     = plt.cm.YlOrRd(norm_hm)
+        rgba[..., 3] = HEAT_ALPHA * norm_hm ** 0.5   # smooth alpha falloff
+        return rgba
+
+    hm_free_rgba = _heatmap_rgba(heatmap_free)
+    hm_n2k_rgba  = _heatmap_rgba(heatmap_n2k)
+
+    def _path_utm(result):
+        if result is None:
+            return None, None
+        xs = [bl[0] + col * cell_m + cell_m / 2 for _, col in result.coords]
+        ys = [bl[1] + row * cell_m + cell_m / 2 for row, _ in result.coords]
+        return xs, ys
+
+    # ---- Figure — A4 portrait, 2 panels, no decorations -----------------------
+    # NaN → white so survey gaps blend seamlessly with the white page background
+    cm_bath2 = copy.copy(CMAP_BATH)
+    cm_bath2.set_bad("white")
+
+    fig = plt.figure(figsize=(8.27, 11.69), dpi=300, facecolor="white")
+
+    # Maps bleed to the left and right edges (no side margins).
+    # Equal top/bottom margins centre the two panels vertically on the page.
+    # GAP = 0 so the two maps touch directly with no white stripe between them.
+    ML, MR = 0.0,  0.0
+    MT, MB = 0.08, 0.08
+    panel_w = 1.0 - ML - MR
+    panel_h = (1.0 - MT - MB) / 2.0
+
+    ax_free = fig.add_axes([ML, MB + panel_h, panel_w, panel_h])
+    ax_n2k  = fig.add_axes([ML, MB,           panel_w, panel_h])
+
+    configs = [
+        (ax_free, hm_free_rgba, consensus_free, False),
+        (ax_n2k,  hm_n2k_rgba,  consensus_n2k,  True),
+    ]
+
+    for ax, hm_rgba, cons_result, show_n2k in configs:
+        ax.imshow(bath_full, cmap=cm_bath2, origin="lower", extent=extent,
+                  interpolation="bilinear", aspect="auto", zorder=1)
+        for rgba in (sw_rgba, var_rgba, amp_rgba):
+            ax.imshow(rgba, origin="lower", extent=extent,
+                      interpolation="bilinear", zorder=2)
+        if show_n2k:
+            ax.imshow(n2k_rgba, origin="lower", extent=extent,
+                      interpolation="nearest", zorder=3)
+        ax.imshow(hm_rgba, origin="lower", extent=extent,
+                  interpolation="bilinear", zorder=4)
+
+        try:
+            import geopandas as gpd
+            for fpath, color in zip(ROUTE_FILES, ROUTE_COLORS):
+                if os.path.exists(fpath):
+                    gpd.read_file(fpath).to_crs(bath.csr).plot(
+                        ax=ax, color=color, linewidth=2.0, zorder=5)
+        except ImportError:
+            pass
+
+        xs_c, ys_c = _path_utm(cons_result)
+        if xs_c is not None:
+            ax.plot(xs_c, ys_c, color=PATH_COLOR, lw=2.2,
+                    solid_capstyle="round", solid_joinstyle="round",
+                    path_effects=[withStroke(linewidth=4.5, foreground=PATH_EDGE)],
+                    zorder=7)
+
+        ax.set_xlim(extent[0], extent[1])
+        ax.set_ylim(extent[2], extent[3])
+        ax.margins(0)
+        ax.set_axis_off()
+
+    _save_or_show(fig, save_path)
+
+
+# ---------------------------------------------------------------------------
 # Figure 11b — Angle-detection failure: cell 93 / CDI 3466117
 # ---------------------------------------------------------------------------
 
@@ -4461,6 +4822,297 @@ def plot_angle_detection_failure(save_path=None):
 
 
 # ---------------------------------------------------------------------------
+# Figure — Annual seabed change rate along the Route 1 corridor
+# ---------------------------------------------------------------------------
+
+def plot_route1_amplitude_along_line(save_path=None, n_per_row=6):
+    """
+    Strip-chart of mean signed annual seabed change rate (m/yr) along Route 1.
+
+    For each 5x5 km cell that Route 1 passes through:
+      - All signed difference rasters in difference_rasters/Rasters_diff for that
+        cell are averaged (mean across survey pairs) to produce one change-rate image.
+      - Cells are ordered by chainage (km along route geometry).
+      - The Route 1 pipeline is overlaid on each panel in pixel coordinates.
+      - The strip is wrapped into rows of n_per_row cells.
+
+    Diverging colormap: blue = accretion, red = erosion, white = stable.
+    """
+    import geopandas as gpd
+    from shapely.geometry import box, Point
+    from shapely.ops import linemerge, unary_union
+
+    DIFF_DIR  = "difference_rasters/Rasters_diff"
+    LINE_PATH = "shapes/line1.shp"
+    BL        = (555652, 5910512)   # bottom-left corner of cost-map grid (UTM 31N)
+    CELL_KM   = 5000                # 5 km cells
+    N_COLS    = 16
+    N_ROWS    = 7
+    LINE_COLOR = "#ffffff"          # white pipeline line
+
+    # ---------------------------------------------------------------- route --
+    line_gdf   = gpd.read_file(LINE_PATH).to_crs("EPSG:32631")
+    route_geom = unary_union(line_gdf.geometry.values)
+    if route_geom.geom_type == "MultiLineString":
+        merged     = linemerge(route_geom)
+        route_geom = merged if merged.geom_type == "LineString" else route_geom
+
+    # ------------------------------------------------------ find cells -------
+    intersecting = []
+    for cell_id in range(N_COLS * N_ROWS):
+        row = cell_id // N_COLS
+        col = cell_id % N_COLS
+        x0  = BL[0] + col * CELL_KM
+        y0  = BL[1] + row * CELL_KM
+        cell_poly = box(x0, y0, x0 + CELL_KM, y0 + CELL_KM)
+        if route_geom.intersects(cell_poly):
+            d = route_geom.project(Point(x0 + CELL_KM / 2, y0 + CELL_KM / 2))
+            intersecting.append((d, cell_id))
+
+    intersecting.sort()
+    cell_order    = [cid       for _, cid in intersecting]
+    cell_dists_km = [d / 1000  for d, _   in intersecting]
+
+    # ------------------------------------------- group diff raster files -----
+    diff_files: dict = {}
+    for fname in os.listdir(DIFF_DIR):
+        if not fname.endswith(".npy"):
+            continue
+        try:
+            cid = int(fname.split("_")[1])
+        except (IndexError, ValueError):
+            continue
+        diff_files.setdefault(cid, []).append(os.path.join(DIFF_DIR, fname))
+
+    # --------------------------------- load + average per cell ---------------
+    cell_rasters: dict = {}
+    for cid in cell_order:
+        if cid not in diff_files:
+            cell_rasters[cid] = None
+            continue
+        arrays  = [np.load(f) for f in diff_files[cid]]
+        stacked = np.stack(arrays, axis=0)
+        cell_rasters[cid] = np.nanmean(stacked, axis=0)
+
+    # ----------------------------------------- symmetric colour limits -------
+    all_vals = np.concatenate([
+        r.ravel() for r in cell_rasters.values() if r is not None
+    ])
+    all_vals = all_vals[np.isfinite(all_vals)]
+    vlim = float(np.nanpercentile(np.abs(all_vals), 99)) if len(all_vals) else 1.0
+
+    # ---------------------------------------------------- layout -------------
+    n_cells        = len(cell_order)
+    n_rows_layout  = int(np.ceil(n_cells / n_per_row))
+    panel_w, panel_h = 2.5, 2.5
+    fig_w = panel_w * n_per_row + 1.8
+    fig_h = panel_h * n_rows_layout + 1.2
+
+    fig, axes = plt.subplots(
+        n_rows_layout, n_per_row,
+        figsize=(fig_w, fig_h),
+        squeeze=False,
+    )
+
+    cmap_div = copy.copy(cmocean.cm.balance)
+    cmap_div.set_bad(NAN_COLOR)
+
+    im_ref = None
+    for idx, (cid, km) in enumerate(zip(cell_order, cell_dists_km)):
+        r  = idx // n_per_row
+        c  = idx %  n_per_row
+        ax = axes[r, c]
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        # Cell UTM bounds
+        cell_col = cid % N_COLS
+        cell_row = cid // N_COLS
+        x_min = BL[0] + cell_col * CELL_KM
+        y_min = BL[1] + cell_row * CELL_KM
+        x_max = x_min + CELL_KM
+        y_max = y_min + CELL_KM
+
+        raster = cell_rasters[cid]
+        if raster is None:
+            ax.set_facecolor(NAN_COLOR)
+            ax.set_title(f"Cell {cid}\n{km:.0f} km", fontsize=7)
+            for spine in ax.spines.values():
+                spine.set_edgecolor("#aaaaaa")
+                spine.set_linewidth(0.8)
+            # Still draw the pipeline on empty cells
+            _overlay_pipeline(ax, route_geom, x_min, y_min, x_max, y_max,
+                               raster_h=250, raster_w=250,
+                               color=LINE_COLOR)
+            # Fix axis limits to match the 250×250 pixel grid (no imshow to anchor them)
+            ax.set_xlim(-0.5, 249.5)
+            ax.set_ylim(249.5, -0.5)   # inverted: row 0 = north = top
+            continue
+
+        h, w = raster.shape
+        im = ax.imshow(
+            np.ma.masked_invalid(raster),
+            cmap=cmap_div,
+            vmin=-vlim, vmax=vlim,
+            origin="upper",
+            interpolation="nearest",
+        )
+        im_ref = im
+        ax.set_title(f"Cell {cid}   {km:.0f} km", fontsize=7, pad=3)
+
+        # Pipeline overlay
+        _overlay_pipeline(ax, route_geom, x_min, y_min, x_max, y_max,
+                          raster_h=h, raster_w=w,
+                          color=LINE_COLOR)
+
+    # Row labels (km range)
+    for r in range(n_rows_layout):
+        start_idx = r * n_per_row
+        end_idx   = min(start_idx + n_per_row - 1, n_cells - 1)
+        axes[r, 0].set_ylabel(
+            f"{cell_dists_km[start_idx]:.0f}–{cell_dists_km[end_idx]:.0f} km",
+            fontsize=8, labelpad=4,
+        )
+
+    # Hide unused axes in the last row
+    used_last_row = n_cells % n_per_row
+    if used_last_row:
+        for j in range(used_last_row, n_per_row):
+            axes[n_rows_layout - 1, j].axis("off")
+
+    # Shared colorbar
+    if im_ref is not None:
+        fig.subplots_adjust(
+            left=0.06, right=0.88, top=0.91, bottom=0.04,
+            hspace=0.40, wspace=0.08,
+        )
+        cbar_ax = fig.add_axes([0.90, 0.12, 0.018, 0.72])
+        cbar    = fig.colorbar(im_ref, cax=cbar_ax, extend="both")
+        cbar.set_label("Annual change rate  [m/yr]\n(mean across survey pairs)",
+                       fontsize=FS - 2, labelpad=6)
+        cbar.ax.tick_params(labelsize=FS - 3)
+    else:
+        fig.tight_layout()
+
+    # Legend for pipeline line
+    from matplotlib.lines import Line2D
+    legend_handle = Line2D([0], [0], color=LINE_COLOR, linewidth=2, label="Route 1")
+    fig.legend(handles=[legend_handle], loc="lower right",
+               bbox_to_anchor=(0.88, 0.04), fontsize=FS - 2, framealpha=0.9)
+
+    fig.suptitle(
+        "Route 1 corridor — mean signed annual seabed change rate per 5×5 km cell",
+        fontsize=FS_TITLE, fontweight="bold", y=0.97,
+    )
+
+    _save_or_show(fig, save_path)
+
+
+def _overlay_pipeline(ax, route_geom, x_min, y_min, x_max, y_max,
+                      raster_h, raster_w, color="#ffffff", lw=3.0):
+    """Clip route_geom to the cell box and draw it in pixel coordinates on ax.
+
+    origin='upper': row 0 is the north edge (y_max), so
+      py = (y_max - y_utm) / (CELL_KM / raster_h)
+      px = (x_utm - x_min) / (CELL_KM / raster_w)
+    """
+    from shapely.geometry import box
+    from shapely.ops import unary_union
+
+    cell_box  = box(x_min, y_min, x_max, y_max)
+    clipped   = route_geom.intersection(cell_box)
+    if clipped.is_empty:
+        return
+
+    x_scale = raster_w / (x_max - x_min)   # px per metre
+    y_scale = raster_h / (y_max - y_min)   # px per metre
+
+    def _utm_to_px(coords):
+        xs = [(x - x_min) * x_scale for x, _ in coords]
+        ys = [(y_max - y) * y_scale for _, y in coords]
+        return xs, ys
+
+    geoms = (clipped.geoms if hasattr(clipped, "geoms") else [clipped])
+    for geom in geoms:
+        if geom.is_empty:
+            continue
+        if geom.geom_type == "LineString":
+            px, py = _utm_to_px(geom.coords)
+            ax.plot(px, py, color=color, linewidth=lw, solid_capstyle="round")
+        elif geom.geom_type == "MultiLineString":
+            for part in geom.geoms:
+                px, py = _utm_to_px(part.coords)
+                ax.plot(px, py, color=color, linewidth=lw, solid_capstyle="round")
+
+
+# ---------------------------------------------------------------------------
+# Figure — Cell 22 temporal comparison: 2023 bathymetry + 2023 − 2004 diff
+# ---------------------------------------------------------------------------
+
+def plot_cell22_temporal_comparison(save_path=None):
+    """
+    Two-panel figure for cell 22 using raw (undestriped) rasters to motivate
+    the destriping preprocessing step:
+      Left  : raw bathymetry 2023 (CDI 3844672), cmocean.deep colormap.
+              Stripe artefacts from multibeam acquisition are clearly visible.
+      Right : depth change 2023 − 2004 (CDI 2174760 baseline), RdBu_r diverging.
+              Without destriping, stripe noise from both surveys aliases into
+              the difference map and masks real seabed change.
+    """
+    path_2023 = "rasters/cell_22_CDI_3844672.npy"
+    path_2004 = "rasters/cell_22_CDI_2174760.npy"
+
+    r2023 = np.load(path_2023)
+    r2004 = np.load(path_2004)
+
+    nan_2023 = np.isnan(r2023)
+    nan_2004 = np.isnan(r2004)
+    nan_diff = nan_2023 | nan_2004
+
+    diff     = r2023 - r2004
+    vmin     = float(np.nanmin(r2023))
+    vmax     = float(np.nanmax(r2023))
+    sym_diff = float(np.nanmax(np.abs(diff[~nan_diff])))
+
+    cm_bath = copy.copy(CMAP_BATH);      cm_bath.set_bad(NAN_COLOR)
+    cm_diff = copy.copy(plt.cm.RdBu_r);  cm_diff.set_bad(NAN_COLOR)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    fig.subplots_adjust(wspace=0.28, left=0.05, right=0.95, top=0.78, bottom=0.05)
+
+    # Left panel — raw 2023 bathymetry
+    im0 = axes[0].imshow(
+        np.ma.masked_where(nan_2023, r2023),
+        cmap=cm_bath, origin="upper", vmin=vmin, vmax=vmax,
+    )
+    axes[0].set_title("Raw bathymetry  —  2023\n(cell 22,  CDI 3844672)",
+                      fontsize=FS_TITLE, pad=10)
+    axes[0].set_xticks([]); axes[0].set_yticks([])
+    cb0 = fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.03)
+    cb0.set_label("Depth (m)", fontsize=FS)
+    cb0.ax.tick_params(labelsize=FS - 2)
+
+    # Right panel — raw difference map
+    im1 = axes[1].imshow(
+        np.ma.masked_where(nan_diff, diff),
+        cmap=cm_diff, origin="upper", vmin=-sym_diff, vmax=sym_diff,
+    )
+    axes[1].set_title(r"Raw depth change  2023 $-$ 2004" + "\n(CDI 3844672 − CDI 2174760)",
+                      fontsize=FS_TITLE, pad=10)
+    axes[1].set_xticks([]); axes[1].set_yticks([])
+    cb1 = fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.03)
+    cb1.set_label(r"$\Delta$ depth (m)", fontsize=FS)
+    cb1.ax.tick_params(labelsize=FS - 2)
+
+    fig.suptitle(
+        "Cell 22  —  raw (undestriped) data  (5 km × 5 km,  20 m resolution)",
+        fontsize=FS_TITLE + 1, fontweight="bold", y=0.97,
+    )
+
+    _save_or_show(fig, save_path)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -4496,7 +5148,10 @@ if __name__ == "__main__":
     # plot_combined_costmaps(save_path=os.path.join(SAVE_DIR, "26_combined_costmaps.png"))
     # plot_optimised_route(save_path=os.path.join(SAVE_DIR, "27_optimised_route.png"))
     # plot_optimised_route_nn(save_path=os.path.join(SAVE_DIR, "27b_optimised_route_nn.png"))
-    plot_sensitivity_route(save_path=os.path.join(SAVE_DIR, "28_sensitivity_route.png"))
-    plot_sensitivity_route_nn(save_path=os.path.join(SAVE_DIR, "28b_sensitivity_route_nn.png"))
+    # plot_sensitivity_route(save_path=os.path.join(SAVE_DIR, "28_sensitivity_route.png"))
+    # plot_sensitivity_route_nn(save_path=os.path.join(SAVE_DIR, "28b_sensitivity_route_nn.png"))
     # plot_angle_detection_failure(save_path=os.path.join(SAVE_DIR, "11b_angle_detection_failure.png"))
+    # plot_route1_amplitude_along_line(save_path=os.path.join(SAVE_DIR, "29_route1_amplitude_along_line.png"))
+    # plot_cell22_temporal_comparison(save_path=os.path.join(SAVE_DIR, "30_cell22_temporal_comparison.png"))
+    plot_cover_art(save_path=os.path.join(SAVE_DIR, "cover_art.png"))
     print(f"\nAll plots saved to: {SAVE_DIR}/")
